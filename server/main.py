@@ -96,7 +96,7 @@ async def not_found_handler(request: Request, _exc):
     return _page(
         title="Not Found",
         heading="File not found",
-        body="This link has expired or was never created. Ask the sender for a new one.",
+        body="This link has expired or was never created.<br/>Ask the sender for a new one.",
     )
 
 
