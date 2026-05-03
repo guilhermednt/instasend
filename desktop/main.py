@@ -36,17 +36,11 @@ from shares import ShareManager
 DEFAULT_CONFIG = {"file_server_port": 8081, "server_url": "", "public_url": ""}
 
 
-def get_app_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        exe = Path(sys.executable)
-        if platform.system() == "Darwin" and exe.parent.name == "MacOS":
-            return exe.parent.parent.parent.parent
-        return exe.parent
-    return Path(__file__).parent
+APP_DIR = Path.home() / ".instasend"
+APP_DIR.mkdir(exist_ok=True)
 
-
-CONFIG_PATH = get_app_dir() / "config.json"
-SHARES_PATH = get_app_dir() / "shares.json"
+CONFIG_PATH = APP_DIR / "config.json"
+SHARES_PATH = APP_DIR / "shares.json"
 
 
 def load_config() -> dict:
@@ -106,7 +100,8 @@ def _make_tray_icon() -> QIcon:
 # ---------------------------------------------------------------------------
 
 class _Signals(QObject):
-    download_updated = Signal(str, int)  # hash, count
+    download_updated = Signal(str, int)   # hash, count
+    share_registered = Signal(str, bool)  # hash, success
 
 
 # ---------------------------------------------------------------------------
@@ -115,13 +110,15 @@ class _Signals(QObject):
 
 class ShareRow(QFrame):
     remove_requested = Signal(str)  # hash
+    retry_requested  = Signal(str)  # hash
 
-    def __init__(self, share: dict, url: str, parent=None):
+    def __init__(self, share: dict, url: str | None, parent=None):
         super().__init__(parent)
         self._hash = share["hash"]
+        self._url: str | None = None
         self._setup_ui(share["filename"], url, share.get("downloads", 0))
 
-    def _setup_ui(self, filename: str, url: str, downloads: int):
+    def _setup_ui(self, filename: str, url: str | None, downloads: int):
         self.setStyleSheet(
             "QFrame { background-color: #313244; border-radius: 8px; border: none; }"
         )
@@ -156,15 +153,51 @@ class ShareRow(QFrame):
         top.addWidget(self.count_label)
         top.addWidget(remove_btn)
 
-        self.url_label = QLabel(url)
-        self.url_label.setStyleSheet(
-            "color: #89b4fa; font-size: 11px; text-decoration: underline;"
-        )
-        self.url_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        bottom = QHBoxLayout()
+        bottom.setContentsMargins(0, 0, 0, 0)
+        bottom.setSpacing(8)
+
+        self.url_label = QLabel()
         self.url_label.mousePressEvent = self._copy_url
+        self.url_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+        self.retry_btn = QPushButton("Retry")
+        self.retry_btn.setFixedHeight(18)
+        self.retry_btn.setStyleSheet(
+            "QPushButton { color: #cba6f7; background: transparent; border: none; font-size: 11px; }"
+            "QPushButton:hover { color: #d0bcff; }"
+        )
+        self.retry_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.retry_btn.clicked.connect(lambda: self.retry_requested.emit(self._hash))
+        self.retry_btn.hide()
+
+        bottom.addWidget(self.url_label)
+        bottom.addWidget(self.retry_btn)
 
         layout.addLayout(top)
-        layout.addWidget(self.url_label)
+        layout.addLayout(bottom)
+
+        self.set_url(url)
+
+    def set_url(self, url: str | None, failed: bool = False):
+        self._url = url
+        if url:
+            self.url_label.setText(url)
+            self.url_label.setStyleSheet(
+                "color: #89b4fa; font-size: 11px; text-decoration: underline;"
+            )
+            self.url_label.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.retry_btn.hide()
+        elif failed:
+            self.url_label.setText("Could not reach server")
+            self.url_label.setStyleSheet("color: #f38ba8; font-size: 11px;")
+            self.url_label.setCursor(Qt.CursorShape.ArrowCursor)
+            self.retry_btn.show()
+        else:
+            self.url_label.setText("Registering…")
+            self.url_label.setStyleSheet("color: #585b70; font-size: 11px;")
+            self.url_label.setCursor(Qt.CursorShape.ArrowCursor)
+            self.retry_btn.hide()
 
     @staticmethod
     def _format_count(count: int) -> str:
@@ -173,9 +206,8 @@ class ShareRow(QFrame):
         return "1 download" if count == 1 else f"{count} downloads"
 
     def _copy_url(self, _event=None):
-        url = self.url_label.text()
-        if url:
-            QApplication.clipboard().setText(url)
+        if self._url:
+            QApplication.clipboard().setText(self._url)
 
     def update_count(self, count: int):
         self.count_label.setText(self._format_count(count))
@@ -186,9 +218,10 @@ class ShareRow(QFrame):
 # ---------------------------------------------------------------------------
 
 class ShareList(QWidget):
-    def __init__(self, on_remove, parent=None):
+    def __init__(self, on_remove, on_retry, parent=None):
         super().__init__(parent)
         self._on_remove = on_remove
+        self._on_retry = on_retry
         self._rows: dict[str, ShareRow] = {}
         self._setup_ui()
 
@@ -208,6 +241,7 @@ class ShareList(QWidget):
         self._empty_label.setVisible(False)
         row = ShareRow(share, url)
         row.remove_requested.connect(self._on_remove)
+        row.retry_requested.connect(self._on_retry)
         self._rows[share["hash"]] = row
         self._layout.addWidget(row)
 
@@ -223,6 +257,11 @@ class ShareList(QWidget):
         row = self._rows.get(hash_val)
         if row:
             row.update_count(count)
+
+    def set_url(self, hash_val: str, url: str | None, failed: bool = False):
+        row = self._rows.get(hash_val)
+        if row:
+            row.set_url(url, failed=failed)
 
     def populate(self, shares: list[dict], url_fn):
         for share in shares:
@@ -329,6 +368,7 @@ class InstaSend:
             server_url=config.get("server_url", ""),
             file_server_port=config["file_server_port"],
             on_download=lambda h, c: self._signals.download_updated.emit(h, c),
+            on_registered=lambda h, ok: self._signals.share_registered.emit(h, ok),
         )
         self._file_server = FileServer(
             port=config["file_server_port"],
@@ -341,11 +381,12 @@ class InstaSend:
         _hide_dock_icon()
 
         self._drop_zone = DropZone()
-        self._share_list = ShareList(on_remove=self._on_remove)
+        self._share_list = ShareList(on_remove=self._on_remove, on_retry=self._on_retry_registration)
 
         self._popup = PopupWindow(self._drop_zone, self._share_list)
         self._popup.file_dropped.connect(self._on_file_dropped)
         self._signals.download_updated.connect(self._share_list.update_count)
+        self._signals.share_registered.connect(self._on_share_registered)
 
         self._tray = QSystemTrayIcon(_make_tray_icon(), self.qt_app)
         self._tray.setToolTip("InstaSend")
@@ -403,9 +444,19 @@ class InstaSend:
             return f"{base}/{hash_val}"
         return f"http://{get_local_ip()}:{self.config['file_server_port']}/{hash_val}"
 
+    def _on_retry_registration(self, hash_val: str):
+        self._share_list.set_url(hash_val, url=None, failed=False)  # back to "Registering…"
+        self._manager.retry_register(hash_val)
+
+    def _on_share_registered(self, hash_val: str, success: bool):
+        url = self._build_url(hash_val) if success else None
+        self._share_list.set_url(hash_val, url, failed=not success)
+
     def _on_file_dropped(self, file_path: Path):
         share = self._manager.add(file_path)
-        self._share_list.add_row(share, self._build_url(share["hash"]))
+        has_server = bool(self.config.get("server_url", "").strip())
+        url = None if has_server else self._build_url(share["hash"])
+        self._share_list.add_row(share, url)
 
     def _on_remove(self, hash_val: str):
         self._manager.remove(hash_val)
@@ -414,8 +465,12 @@ class InstaSend:
     def run(self) -> int:
         self._manager.load()
         self._file_server.start()
+
+        has_server = bool(self.config.get("server_url", "").strip())
+        url_fn = (lambda h: None) if has_server else self._build_url
+        self._share_list.populate(self._manager.all(), url_fn=url_fn)
+
         threading.Thread(target=self._manager.startup_sync, daemon=True).start()
-        self._share_list.populate(self._manager.all(), url_fn=self._build_url)
 
         self._tray.show()
         self._show_popup()

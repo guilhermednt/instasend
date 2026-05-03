@@ -33,12 +33,14 @@ class ShareManager:
         shares_path: Path,
         server_url: str,
         file_server_port: int,
-        on_download=None,  # callable(hash: str, count: int) | None
+        on_download=None,    # callable(hash: str, count: int) | None
+        on_registered=None,  # callable(hash: str, success: bool) | None
     ):
         self._path = shares_path
         self._server_url = server_url.rstrip("/") if server_url else ""
         self._port = file_server_port
         self._on_download = on_download
+        self._on_registered = on_registered
         self._shares: dict[str, dict] = {}
         self._lock = threading.Lock()
 
@@ -128,6 +130,15 @@ class ShareManager:
     # Server API (D3)
     # ------------------------------------------------------------------
 
+    def retry_register(self, hash_val: str):
+        """Re-attempt server registration for a single share."""
+        with self._lock:
+            share = self._shares.get(hash_val)
+        if share:
+            threading.Thread(
+                target=self._server_register, args=(hash_val, share["filename"]), daemon=True
+            ).start()
+
     def startup_sync(self):
         """Re-register all persisted shares with the Server after a restart."""
         with self._lock:
@@ -139,13 +150,16 @@ class ShareManager:
         if not self._server_url:
             return
         try:
-            requests.post(
+            r = requests.post(
                 f"{self._server_url}/shares",
                 json={"hash": hash_val, "port": self._port, "filename": filename},
                 timeout=5,
             )
+            success = r.status_code in (200, 201)
         except Exception:
-            pass  # Server unavailable; InstaSend still works locally
+            success = False
+        if self._on_registered:
+            self._on_registered(hash_val, success)
 
     def _server_unregister(self, hash_val: str):
         if not self._server_url:
