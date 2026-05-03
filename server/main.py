@@ -5,8 +5,50 @@ from contextlib import asynccontextmanager
 import aiosqlite
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
+
+# ---------------------------------------------------------------------------
+# HTML page helpers
+# ---------------------------------------------------------------------------
+
+def _page(title: str, heading: str, body: str) -> HTMLResponse:
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{title} — InstaSend</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background: #1e1e2e; color: #cdd6f4;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      display: flex; align-items: center; justify-content: center;
+      min-height: 100vh; padding: 24px;
+    }}
+    .card {{
+      text-align: center; max-width: 480px; width: 100%;
+    }}
+    h1 {{ font-size: 2rem; margin-bottom: 12px; }}
+    p  {{ color: #a6adc8; line-height: 1.6; }}
+    .badge {{
+      display: inline-block; margin-bottom: 24px;
+      font-size: 0.75rem; font-weight: 600; letter-spacing: .08em;
+      text-transform: uppercase; color: #89b4fa;
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="badge">InstaSend</div>
+    <h1>{heading}</h1>
+    <p>{body}</p>
+  </div>
+</body>
+</html>"""
+    return HTMLResponse(html)
 
 DB_PATH = os.environ.get("DB_PATH", "shares.db")
 INTERNAL_NETWORK = ipaddress.IPv4Network(
@@ -30,6 +72,59 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Index page
+# ---------------------------------------------------------------------------
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return _page(
+        title="InstaSend",
+        heading="InstaSend",
+        body="Drop a file into the InstaSend app to generate a share link.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Custom error pages
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(404)
+async def not_found_handler(request: Request, _exc):
+    return _page(
+        title="Not Found",
+        heading="File not found",
+        body="This link has expired or was never created. Ask the sender for a new one.",
+    )
+
+
+@app.exception_handler(403)
+async def forbidden_handler(request: Request, _exc):
+    return _page(
+        title="Forbidden",
+        heading="Access denied",
+        body="This action is only available from the local network.",
+    )
+
+
+@app.exception_handler(503)
+async def unavailable_handler(request: Request, _exc):
+    return _page(
+        title="Unavailable",
+        heading="File temporarily unavailable",
+        body="The host machine is offline or the InstaSend app is not running. Try again later.",
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_handler(request: Request, _exc):
+    return _page(
+        title="Bad Request",
+        heading="Bad request",
+        body="The request could not be understood.",
+    )
 
 
 # ---------------------------------------------------------------------------

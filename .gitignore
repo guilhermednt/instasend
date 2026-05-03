@@ -13,7 +13,7 @@ desktop/*.spec
 
 # Runtime data
 desktop/shares.json
-server/shares.db
+server/data/
 
 # macOS
 .DS_Store

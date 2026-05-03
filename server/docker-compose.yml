@@ -1,0 +1,11 @@
+services:
+  server:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      DB_PATH: /data/shares.db
+      INTERNAL_NETWORK: "10.0.0.0/24"
+    restart: unless-stopped
