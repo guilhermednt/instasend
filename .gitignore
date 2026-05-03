@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+
+# PyInstaller
+desktop/build/
+desktop/dist/
+desktop/*.spec
+
+# Runtime data
+desktop/shares.json
+server/shares.db
+
+# macOS
+.DS_Store
