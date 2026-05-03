@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 from file_server import FileServer
 from shares import ShareManager
 
-DEFAULT_CONFIG = {"file_server_port": 8081, "server_url": ""}
+DEFAULT_CONFIG = {"file_server_port": 8081, "server_url": "", "public_url": ""}
 
 
 def get_app_dir() -> Path:
@@ -300,9 +300,14 @@ class InstaSend:
         self.window = window
 
     def _build_url(self, hash_val: str) -> str:
-        server_url = self.config.get("server_url", "").strip().rstrip("/")
-        if server_url:
-            return f"{server_url}/{hash_val}"
+        # public_url: what's shown to the user (e.g. https://dl.666.fail)
+        # Falls back to server_url, then to the local IP.
+        base = (
+            self.config.get("public_url", "")
+            or self.config.get("server_url", "")
+        ).strip().rstrip("/")
+        if base:
+            return f"{base}/{hash_val}"
         return f"http://{get_local_ip()}:{self.config['file_server_port']}/{hash_val}"
 
     def _on_file_dropped(self, file_path: Path):
