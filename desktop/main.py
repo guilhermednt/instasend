@@ -5,17 +5,27 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent  # noqa: F401 (used in MainWindow)
+from PySide6.QtCore import QObject, QPoint, Qt, Signal
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QIcon,
+    QPainter,
+    QPixmap,
+    QPolygon,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QMainWindow,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -55,6 +65,42 @@ def get_local_ip() -> str:
         s.close()
 
 
+def _hide_dock_icon():
+    """Remove the app from the Dock and Cmd+Tab switcher (macOS only)."""
+    if platform.system() != "Darwin":
+        return
+    try:
+        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyAccessory
+        )
+    except Exception:
+        pass
+
+
+def _make_tray_icon() -> QIcon:
+    """Draw a minimal send-arrow icon for the menu bar."""
+    size = 22
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#89b4fa"))
+    arrow = QPolygon([
+        QPoint(11, 2),
+        QPoint(19, 13),
+        QPoint(14, 13),
+        QPoint(14, 20),
+        QPoint(8, 20),
+        QPoint(8, 13),
+        QPoint(3, 13),
+    ])
+    painter.drawPolygon(arrow)
+    painter.end()
+    return QIcon(pixmap)
+
+
 # ---------------------------------------------------------------------------
 # Cross-thread signals
 # ---------------------------------------------------------------------------
@@ -84,7 +130,6 @@ class ShareRow(QFrame):
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(4)
 
-        # Top row: filename + download count + remove button
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
 
@@ -111,7 +156,6 @@ class ShareRow(QFrame):
         top.addWidget(self.count_label)
         top.addWidget(remove_btn)
 
-        # Bottom row: URL
         self.url_label = QLabel(url)
         self.url_label.setStyleSheet(
             "color: #89b4fa; font-size: 11px; text-decoration: underline;"
@@ -219,13 +263,36 @@ class DropZone(QWidget):
         )
 
 
-class MainWindow(QMainWindow):
+# ---------------------------------------------------------------------------
+# Popup window
+# ---------------------------------------------------------------------------
+
+class PopupWindow(QWidget):
     file_dropped = Signal(object)  # pathlib.Path
 
-    def __init__(self, drop_zone: DropZone):
+    def __init__(self, drop_zone: DropZone, share_list: ShareList):
         super().__init__()
         self._drop_zone = drop_zone
         self.setAcceptDrops(True)
+        self.setWindowTitle("InstaSend")
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setMinimumSize(500, 400)
+        self.resize(500, 500)
+
+        self.setStyleSheet("background-color: #1e1e2e;")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(12)
+        outer.addWidget(drop_zone)
+
+        scroll = QScrollArea()
+        scroll.setWidget(share_list)
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background-color: #1e1e2e; }")
+        outer.addWidget(scroll)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -269,39 +336,65 @@ class InstaSend:
         )
 
         self.qt_app = QApplication(sys.argv)
+        self.qt_app.setQuitOnLastWindowClosed(False)
+
+        _hide_dock_icon()
 
         self._drop_zone = DropZone()
-        window = MainWindow(self._drop_zone)
-        window.setWindowTitle("InstaSend")
-        window.setMinimumSize(500, 400)
-        window.resize(500, 500)
-        window.file_dropped.connect(self._on_file_dropped)
-
-        central = QWidget()
-        central.setStyleSheet("background-color: #1e1e2e;")
-        window.setCentralWidget(central)
-
-        outer = QVBoxLayout(central)
-        outer.setContentsMargins(16, 16, 16, 16)
-        outer.setSpacing(12)
-
-        outer.addWidget(self._drop_zone)
-
         self._share_list = ShareList(on_remove=self._on_remove)
-        scroll = QScrollArea()
-        scroll.setWidget(self._share_list)
-        scroll.setWidgetResizable(True)
-        scroll.setStyleSheet(
-            "QScrollArea { border: none; background-color: #1e1e2e; }"
-        )
-        outer.addWidget(scroll)
 
+        self._popup = PopupWindow(self._drop_zone, self._share_list)
+        self._popup.file_dropped.connect(self._on_file_dropped)
         self._signals.download_updated.connect(self._share_list.update_count)
-        self.window = window
+
+        self._tray = QSystemTrayIcon(_make_tray_icon(), self.qt_app)
+        self._tray.setToolTip("InstaSend")
+        self._tray.activated.connect(self._on_tray_activated)
+
+        self._tray_menu = QMenu()
+        show_action = QAction("Show", self.qt_app)
+        show_action.triggered.connect(self._show_popup)
+        quit_action = QAction("Quit", self.qt_app)
+        quit_action.triggered.connect(self.qt_app.quit)
+        self._tray_menu.addAction(show_action)
+        self._tray_menu.addSeparator()
+        self._tray_menu.addAction(quit_action)
+        # Do not call setContextMenu — on macOS that causes the menu to intercept
+        # left clicks unpredictably. Context clicks are handled in _on_tray_activated.
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            if self._popup.isVisible():
+                self._popup.hide()
+            else:
+                self._show_popup()
+        elif reason == QSystemTrayIcon.ActivationReason.Context:
+            from PySide6.QtGui import QCursor
+            self._tray_menu.popup(QCursor.pos())
+
+    def _show_popup(self):
+        screen = QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        pw = self._popup.width()
+        ph = self._popup.height()
+
+        tray_geom = self._tray.geometry()
+        if tray_geom.isValid():
+            x = max(avail.left(), min(tray_geom.center().x() - pw // 2, avail.right() - pw))
+            y = tray_geom.bottom() + 4
+        else:
+            x = avail.right() - pw - 10
+            y = avail.top() + 30
+
+        if y + ph > avail.bottom():
+            y = avail.bottom() - ph
+
+        self._popup.move(x, y)
+        self._popup.show()
+        self._popup.raise_()
+        self._popup.activateWindow()
 
     def _build_url(self, hash_val: str) -> str:
-        # public_url: what's shown to the user (e.g. https://dl.666.fail)
-        # Falls back to server_url, then to the local IP.
         base = (
             self.config.get("public_url", "")
             or self.config.get("server_url", "")
@@ -324,7 +417,9 @@ class InstaSend:
         threading.Thread(target=self._manager.startup_sync, daemon=True).start()
         self._share_list.populate(self._manager.all(), url_fn=self._build_url)
 
-        self.window.show()
+        self._tray.show()
+        self._show_popup()
+
         code = self.qt_app.exec()
         self._file_server.stop()
         return code
