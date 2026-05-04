@@ -457,6 +457,11 @@ class InstaSend:
         self._popup.raise_()
         self._popup.activateWindow()
 
+        if bool(self.config.get("server_url", "").strip()):
+            for share in self._manager.all():
+                self._share_list.set_url(share["hash"], url=None, failed=False)
+            threading.Thread(target=self._manager.startup_sync, daemon=True).start()
+
     def _build_url(self, hash_val: str) -> str:
         base = (
             self.config.get("public_url", "")
