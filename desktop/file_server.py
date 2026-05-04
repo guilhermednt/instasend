@@ -28,7 +28,7 @@ class FileServer:
                 self._respond(head_only=False)
 
             def _respond(self, head_only: bool):
-                hash_val = self.path.lstrip("/")
+                hash_val = self.path.split("?")[0].lstrip("/")
                 share = manager.get(hash_val)
 
                 if share is None:
@@ -43,7 +43,9 @@ class FileServer:
                     return
 
                 file_size = file_path.stat().st_size
-                safe_name = share["filename"].replace('"', '\\"')
+                safe_name = "".join(
+                    c for c in share["filename"] if ord(c) >= 0x20 and c != '"'
+                ) or "download"
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")

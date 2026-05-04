@@ -12,7 +12,7 @@ shares.json schema:
 """
 
 import json
-import random
+import secrets
 import string
 import threading
 from pathlib import Path
@@ -24,7 +24,7 @@ HASH_LEN = 6
 
 
 def _generate_hash() -> str:
-    return "".join(random.choices(HASH_CHARS, k=HASH_LEN))
+    return "".join(secrets.choice(HASH_CHARS) for _ in range(HASH_LEN))
 
 
 class ShareManager:
@@ -60,8 +60,8 @@ class ShareManager:
             for h, share in data.items():
                 if Path(share.get("path", "")).is_file():
                     self._shares[h] = share
-        # Persist back in case any stale entries were dropped
-        self._save_locked()
+            # Persist back in case any stale entries were dropped
+            self._save_locked()
 
     def _save_locked(self):
         """Write current shares to disk. Must be called with _lock held."""
