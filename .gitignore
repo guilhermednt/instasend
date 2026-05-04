@@ -14,6 +14,7 @@ desktop/*.spec
 # Runtime data
 desktop/shares.json
 server/data/
+server/.env
 
 # macOS
 .DS_Store

@@ -1,4 +1,5 @@
 import ipaddress
+import logging
 import os
 from contextlib import asynccontextmanager
 
@@ -7,13 +8,34 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from starlette.middleware.base import BaseHTTPMiddleware
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("instasend")
 
 # ---------------------------------------------------------------------------
 # HTML page helpers
 # ---------------------------------------------------------------------------
 
-def _page(title: str, heading: str, body: str) -> HTMLResponse:
+_SECURITY_HEADERS = {
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+def _page(title: str, heading: str, body: str, status_code: int = 200) -> HTMLResponse:
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -48,12 +70,27 @@ def _page(title: str, heading: str, body: str) -> HTMLResponse:
   </div>
 </body>
 </html>"""
-    return HTMLResponse(html)
+    return HTMLResponse(html, status_code=status_code)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 DB_PATH = os.environ.get("DB_PATH", "shares.db")
 INTERNAL_NETWORK = ipaddress.IPv4Network(
     os.environ.get("INTERNAL_NETWORK", "10.0.0.0/24")
 )
+
+# ---------------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------------
+
+limiter = Limiter(key_func=get_remote_address)
+
+# ---------------------------------------------------------------------------
+# App + middleware
+# ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
@@ -72,6 +109,72 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.state.limiter = limiter
+
+
+class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        for k, v in _SECURITY_HEADERS.items():
+            response.headers[k] = v
+        return response
+
+
+app.add_middleware(_SecurityHeadersMiddleware)
+
+
+# ---------------------------------------------------------------------------
+# Exception handlers
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, _exc):
+    return _page(
+        title="Too Many Requests",
+        heading="Slow down",
+        body="Too many requests. Please try again in a moment.",
+        status_code=429,
+    )
+
+
+@app.exception_handler(404)
+async def not_found_handler(request: Request, _exc):
+    return _page(
+        title="Not Found",
+        heading="File not found",
+        body="This link has expired or was never created. Ask the sender for a new one.",
+        status_code=404,
+    )
+
+
+@app.exception_handler(403)
+async def forbidden_handler(request: Request, _exc):
+    return _page(
+        title="Forbidden",
+        heading="Access denied",
+        body="This action is only available from the local network.",
+        status_code=403,
+    )
+
+
+@app.exception_handler(503)
+async def unavailable_handler(request: Request, _exc):
+    return _page(
+        title="Unavailable",
+        heading="File temporarily unavailable",
+        body="The host machine is offline or the InstaSend app is not running. Try again later.",
+        status_code=503,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_handler(request: Request, _exc):
+    return _page(
+        title="Bad Request",
+        heading="Bad request",
+        body="The request could not be understood.",
+        status_code=400,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -88,47 +191,7 @@ async def index():
 
 
 # ---------------------------------------------------------------------------
-# Custom error pages
-# ---------------------------------------------------------------------------
-
-@app.exception_handler(404)
-async def not_found_handler(request: Request, _exc):
-    return _page(
-        title="Not Found",
-        heading="File not found",
-        body="This link has expired or was never created.<br/>Ask the sender for a new one.",
-    )
-
-
-@app.exception_handler(403)
-async def forbidden_handler(request: Request, _exc):
-    return _page(
-        title="Forbidden",
-        heading="Access denied",
-        body="This action is only available from the local network.",
-    )
-
-
-@app.exception_handler(503)
-async def unavailable_handler(request: Request, _exc):
-    return _page(
-        title="Unavailable",
-        heading="File temporarily unavailable",
-        body="The host machine is offline or the InstaSend app is not running. Try again later.",
-    )
-
-
-@app.exception_handler(RequestValidationError)
-async def validation_handler(request: Request, _exc):
-    return _page(
-        title="Bad Request",
-        heading="Bad request",
-        body="The request could not be understood.",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Internal-network guard (S4)
+# Internal-network guard
 # ---------------------------------------------------------------------------
 
 def require_internal(request: Request):
@@ -148,7 +211,7 @@ def require_internal(request: Request):
 
 class ShareIn(BaseModel):
     hash: str
-    port: int
+    port: int = Field(..., ge=1, le=65535)  # fix 10: validated port range
     filename: str
 
 
@@ -169,33 +232,37 @@ async def register_share(body: ShareIn, request: Request):
             (body.hash, client_ip, body.port, body.filename),
         )
         await db.commit()
+    logger.info("registered share hash=%s ip=%s port=%d filename=%r",
+                body.hash, client_ip, body.port, body.filename)
     return {"hash": body.hash, "client_ip": client_ip}
 
 
 @app.delete("/shares/{hash}", status_code=204, dependencies=[Depends(require_internal)])
-async def delete_share(hash: str):
+async def delete_share(hash: str, request: Request):
     """Remove a share entirely. Future GET requests for this hash return 404."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM shares WHERE hash = ?", (hash,))
         await db.commit()
+    logger.info("deleted share hash=%s by=%s", hash,
+                request.client.host if request.client else "unknown")
 
 
 # ---------------------------------------------------------------------------
-# Public download endpoint (S7)
+# Public download endpoint
 # ---------------------------------------------------------------------------
 
-# Headers the upstream sends that we must not blindly forward to the client
-# (they describe the upstream connection, not the proxied one).
-_HOP_BY_HOP = {
-    "connection", "keep-alive", "transfer-encoding",
-    "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate",
-}
+# Allowlist of upstream headers safe to forward (fix 2: replaces hop-by-hop blocklist)
+_UPSTREAM_HEADER_ALLOWLIST = {"content-disposition", "content-length", "last-modified", "etag"}
 
 PROXY_TIMEOUT = httpx.Timeout(10.0, read=None)  # no read timeout for large files
 
 
 @app.get("/{hash}")
-async def download(hash: str):
+@limiter.limit("30/minute")  # fix 5: rate limiting
+async def download(request: Request, hash: str):
+    client_host = request.client.host if request.client else "unknown"
+    logger.info("download request hash=%s from=%s", hash, client_host)
+
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT client_ip, port, filename FROM shares WHERE hash = ?", (hash,)
@@ -219,21 +286,26 @@ async def download(hash: str):
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
             head = await client.head(upstream)
     except httpx.ConnectError:
+        logger.warning("upstream unreachable hash=%s upstream=%s", hash, upstream)
         raise HTTPException(status_code=503, detail="File host unreachable")
     except httpx.TimeoutException:
+        logger.warning("upstream timed out hash=%s upstream=%s", hash, upstream)
         raise HTTPException(status_code=503, detail="File host timed out")
 
     if head.status_code == 404:
         raise HTTPException(status_code=404, detail="Not found")
 
+    # fix 2: forward only safe, explicitly allowed headers
     headers = {
         k: v for k, v in head.headers.items()
-        if k.lower() not in _HOP_BY_HOP
+        if k.lower() in _UPSTREAM_HEADER_ALLOWLIST
     }
+
+    logger.info("serving hash=%s to=%s", hash, client_host)
 
     return StreamingResponse(
         stream_upstream(),
         status_code=200,
         headers=headers,
-        media_type=head.headers.get("content-type", "application/octet-stream"),
+        media_type="application/octet-stream",  # fix 1: always force, never trust upstream
     )
