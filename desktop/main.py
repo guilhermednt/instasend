@@ -1,6 +1,7 @@
 import json
 import platform
 import socket
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -34,6 +35,22 @@ from file_server import FileServer
 from shares import ShareManager
 
 DEFAULT_CONFIG = {"file_server_port": 8081, "server_url": "", "public_url": ""}
+
+
+def _get_version() -> str:
+    try:
+        from _version import __version__
+        return __version__
+    except ImportError:
+        pass
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, cwd=Path(__file__).parent,
+        )
+        return result.stdout.strip() or "dev"
+    except Exception:
+        return "dev"
 
 
 APP_DIR = Path.home() / ".instasend"
@@ -309,7 +326,7 @@ class DropZone(QWidget):
 class PopupWindow(QWidget):
     file_dropped = Signal(object)  # pathlib.Path
 
-    def __init__(self, drop_zone: DropZone, share_list: ShareList):
+    def __init__(self, drop_zone: DropZone, share_list: ShareList, version: str):
         super().__init__()
         self._drop_zone = drop_zone
         self.setAcceptDrops(True)
@@ -332,6 +349,11 @@ class PopupWindow(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet("QScrollArea { border: none; background-color: #1e1e2e; }")
         outer.addWidget(scroll)
+
+        version_label = QLabel(version)
+        version_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        version_label.setStyleSheet("color: #45475a; font-size: 10px;")
+        outer.addWidget(version_label)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -383,7 +405,7 @@ class InstaSend:
         self._drop_zone = DropZone()
         self._share_list = ShareList(on_remove=self._on_remove, on_retry=self._on_retry_registration)
 
-        self._popup = PopupWindow(self._drop_zone, self._share_list)
+        self._popup = PopupWindow(self._drop_zone, self._share_list, _get_version())
         self._popup.file_dropped.connect(self._on_file_dropped)
         self._signals.download_updated.connect(self._share_list.update_count)
         self._signals.share_registered.connect(self._on_share_registered)

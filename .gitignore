@@ -10,6 +10,7 @@ __pycache__/
 desktop/build/
 desktop/dist/
 desktop/*.spec
+desktop/_version.py
 
 # Runtime data
 desktop/shares.json

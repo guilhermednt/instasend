@@ -7,7 +7,22 @@ import sys
 from pathlib import Path
 
 
+def _write_version():
+    """Write _version.py with the current git commit ID so it gets bundled."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, check=True,
+        )
+        commit = result.stdout.strip()
+    except Exception:
+        commit = "unknown"
+    Path("_version.py").write_text(f'__version__ = "{commit}"\n')
+    print(f"Version: {commit}")
+
+
 def main():
+    _write_version()
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--windowed",
