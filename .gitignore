@@ -13,6 +13,7 @@ desktop/*.spec
 desktop/_version.py
 
 # Runtime data
+desktop/config.json
 desktop/shares.json
 server/data/
 server/.env

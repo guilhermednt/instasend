@@ -72,6 +72,7 @@ class ShareManager:
             self._path.write_text(
                 json.dumps(list(self._shares.values()), indent=2)
             )
+            self._path.chmod(0o600)
         except Exception:
             pass
 

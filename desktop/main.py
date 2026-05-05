@@ -72,6 +72,7 @@ def load_config() -> dict:
 def _save_config(config: dict):
     try:
         CONFIG_PATH.write_text(json.dumps(config, indent=2))
+        CONFIG_PATH.chmod(0o600)
     except Exception:
         pass
 
@@ -82,6 +83,7 @@ def _get_or_create_client_id() -> str:
         return CLIENT_ID_PATH.read_text().strip()
     client_id = uuid.uuid4().hex
     CLIENT_ID_PATH.write_text(client_id)
+    CLIENT_ID_PATH.chmod(0o600)
     return client_id
 
 

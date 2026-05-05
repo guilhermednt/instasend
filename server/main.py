@@ -1,10 +1,12 @@
 import asyncio
+import hmac
 import logging
 import os
 import secrets
 import string
 import uuid
 from contextlib import asynccontextmanager
+from urllib.parse import quote
 
 import aiosqlite
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -35,6 +37,8 @@ _SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+    "Strict-Transport-Security": "max-age=63072000; includeSubDomains",
 }
 
 
@@ -84,6 +88,14 @@ DB_PATH = os.environ.get("DB_PATH", "/data/shares.db")
 TOKEN   = os.environ.get("TOKEN", "")
 
 # ---------------------------------------------------------------------------
+# Per-connection limits
+# ---------------------------------------------------------------------------
+
+MAX_HASHES_PER_CLIENT    = 20   # max active shares a single desktop can register
+MAX_WS_PER_IP            = 3    # max concurrent WebSocket connections from one IP
+MAX_CONCURRENT_REQUESTS  = 20   # max in-flight downloads per desktop connection
+
+# ---------------------------------------------------------------------------
 # Hash generation
 # ---------------------------------------------------------------------------
 
@@ -106,6 +118,11 @@ async def _generate_hash(db: aiosqlite.Connection) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not TOKEN or TOKEN == "change-me":
+        raise RuntimeError(
+            "TOKEN env var is not set or is the default placeholder — "
+            "set a strong token before starting the server"
+        )
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS shares (
@@ -172,6 +189,9 @@ class Registry:
 
 
 registry = Registry()
+
+# Active WebSocket connections per remote IP — used to enforce MAX_WS_PER_IP.
+_active_ws_per_ip: dict[str, int] = {}
 
 # ---------------------------------------------------------------------------
 # Rate limiter
@@ -242,114 +262,132 @@ async def index():
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
 
-    # First frame must be register, received within 10 s
+    ip = ws.client.host if ws.client else "unknown"
+    if _active_ws_per_ip.get(ip, 0) >= MAX_WS_PER_IP:
+        await ws.close(code=4008, reason="Too many connections")
+        return
+    _active_ws_per_ip[ip] = _active_ws_per_ip.get(ip, 0) + 1
     try:
-        raw = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
-        msg = protocol.decode(raw)
-    except asyncio.TimeoutError:
-        await ws.close(code=4002, reason="Registration timeout")
-        return
-    except ValueError:
-        await ws.close(code=4002, reason="Protocol error")
-        return
+        # First frame must be register, received within 10 s
+        try:
+            raw = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
+            msg = protocol.decode(raw)
+        except asyncio.TimeoutError:
+            await ws.close(code=4002, reason="Registration timeout")
+            return
+        except ValueError:
+            await ws.close(code=4002, reason="Protocol error")
+            return
 
-    if not isinstance(msg, protocol.Register):
-        await ws.close(code=4002, reason="Expected register message")
-        return
+        if not isinstance(msg, protocol.Register):
+            await ws.close(code=4002, reason="Expected register message")
+            return
 
-    if msg.version != protocol.PROTOCOL_VERSION:
-        await ws.close(
-            code=4003,
-            reason=f"Protocol version mismatch: server={protocol.PROTOCOL_VERSION} client={msg.version}",
-        )
-        return
+        if msg.version != protocol.PROTOCOL_VERSION:
+            await ws.close(code=4003, reason="Protocol version mismatch")
+            return
 
-    if not TOKEN or msg.token != TOKEN:
-        await ws.close(code=4001, reason="Authentication failed")
-        return
+        if not TOKEN or not hmac.compare_digest(msg.token, TOKEN):
+            await ws.close(code=4001, reason="Authentication failed")
+            return
 
-    client_id = msg.client_id
-    conn = registry.connect(ws, client_id)
+        if len(msg.hashes) > MAX_HASHES_PER_CLIENT:
+            await ws.close(code=4002, reason="Too many hashes")
+            return
 
-    # Validate ownership of each stored hash.
-    # Hashes owned by this client are re-registered in the live registry.
-    # Any hash that is unrecognised or owned by a different client is retired
-    # and a fresh one is assigned — the desktop is notified via `assigned`.
-    async with aiosqlite.connect(DB_PATH) as db:
-        for entry in msg.hashes:
-            hash_val = entry["hash"]
-            filename = entry["filename"]
+        client_id = msg.client_id
+        conn = registry.connect(ws, client_id)
 
-            async with db.execute(
-                "SELECT client_id FROM shares WHERE hash = ?", (hash_val,)
-            ) as cur:
-                row = await cur.fetchone()
+        # Validate ownership of each stored hash.
+        # Hashes owned by this client are re-registered in the live registry.
+        # Any hash that is unrecognised or owned by a different client is retired
+        # and a fresh one is assigned — the desktop is notified via `assigned`.
+        async with aiosqlite.connect(DB_PATH) as db:
+            for entry in msg.hashes:
+                hash_val = entry["hash"]
+                filename = entry["filename"]
 
-            if row is not None and row[0] == client_id:
-                registry.add(conn, hash_val)
-            else:
-                new_hash = await _generate_hash(db)
-                await db.execute(
-                    "INSERT INTO shares (hash, client_id, filename) VALUES (?, ?, ?)",
-                    (new_hash, client_id, filename),
-                )
-                await db.commit()
-                registry.add(conn, new_hash)
-                await ws.send_text(protocol.encode(
-                    protocol.Assigned(filename=filename, hash=new_hash)
-                ))
-                logger.info("ws reassigned %s → %s client=%s", hash_val, new_hash, client_id[:8])
+                async with db.execute(
+                    "SELECT client_id FROM shares WHERE hash = ?", (hash_val,)
+                ) as cur:
+                    row = await cur.fetchone()
 
-    logger.info("ws connected client=%s hashes=%d", client_id[:8], len(conn.hashes))
-
-    try:
-        while True:
-            frame = await ws.receive()
-
-            if frame["type"] == "websocket.disconnect":
-                break
-
-            if frame.get("text"):
-                try:
-                    msg = protocol.decode(frame["text"])
-                except ValueError:
-                    await ws.close(code=4002, reason="Protocol error")
-                    return
-
-                if isinstance(msg, protocol.Add):
-                    async with aiosqlite.connect(DB_PATH) as db:
-                        new_hash = await _generate_hash(db)
-                        await db.execute(
-                            "INSERT INTO shares (hash, client_id, filename) VALUES (?, ?, ?)",
-                            (new_hash, client_id, msg.filename),
-                        )
-                        await db.commit()
+                if row is not None and row[0] == client_id:
+                    registry.add(conn, hash_val)
+                else:
+                    new_hash = await _generate_hash(db)
+                    await db.execute(
+                        "INSERT INTO shares (hash, client_id, filename) VALUES (?, ?, ?)",
+                        (new_hash, client_id, filename),
+                    )
+                    await db.commit()
                     registry.add(conn, new_hash)
                     await ws.send_text(protocol.encode(
-                        protocol.Assigned(filename=msg.filename, hash=new_hash)
+                        protocol.Assigned(filename=filename, hash=new_hash)
                     ))
-                    logger.info("ws add hash=%s client=%s", new_hash, client_id[:8])
+                    logger.info("ws reassigned %s → %s client=%s", hash_val, new_hash, client_id[:8])
 
-                elif isinstance(msg, protocol.Remove):
-                    registry.remove(conn, msg.hash)
-                    # Hash is intentionally kept in DB so it can never be
-                    # reassigned to a different client.
-                    logger.info("ws remove hash=%s", msg.hash)
+        logger.info("ws connected client=%s hashes=%d", client_id[:8], len(conn.hashes))
 
-                else:
-                    # Response / Error frames: routed to download handler (S4)
-                    conn.dispatch(msg)
+        try:
+            while True:
+                frame = await ws.receive()
 
-            elif frame.get("bytes"):
-                # Binary chunk frames: routed to download handler (S4)
-                conn.dispatch_chunk(frame["bytes"])
+                if frame["type"] == "websocket.disconnect":
+                    break
 
-    except WebSocketDisconnect:
-        pass
+                if frame.get("text"):
+                    try:
+                        msg = protocol.decode(frame["text"])
+                    except ValueError:
+                        await ws.close(code=4002, reason="Protocol error")
+                        return
+
+                    if isinstance(msg, protocol.Add):
+                        if len(conn.hashes) >= MAX_HASHES_PER_CLIENT:
+                            await ws.close(code=4002, reason="Too many active shares")
+                            return
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            new_hash = await _generate_hash(db)
+                            await db.execute(
+                                "INSERT INTO shares (hash, client_id, filename) VALUES (?, ?, ?)",
+                                (new_hash, client_id, msg.filename),
+                            )
+                            await db.commit()
+                        registry.add(conn, new_hash)
+                        await ws.send_text(protocol.encode(
+                            protocol.Assigned(filename=msg.filename, hash=new_hash)
+                        ))
+                        logger.info("ws add hash=%s client=%s", new_hash, client_id[:8])
+
+                    elif isinstance(msg, protocol.Remove):
+                        registry.remove(conn, msg.hash)
+                        # Hash is intentionally kept in DB so it can never be
+                        # reassigned to a different client.
+                        logger.info("ws remove hash=%s", msg.hash)
+
+                    else:
+                        # Response / Error frames: routed to download handler
+                        conn.dispatch(msg)
+
+                elif frame.get("bytes"):
+                    try:
+                        conn.dispatch_chunk(frame["bytes"])
+                    except (ValueError, UnicodeDecodeError):
+                        await ws.close(code=4002, reason="Protocol error")
+                        return
+
+        except WebSocketDisconnect:
+            pass
+        finally:
+            logger.info("ws disconnected client=%s released %d hashes",
+                        client_id[:8], len(conn.hashes))
+            registry.disconnect(conn)
+
     finally:
-        logger.info("ws disconnected client=%s released %d hashes",
-                    client_id[:8], len(conn.hashes))
-        registry.disconnect(conn)
+        _active_ws_per_ip[ip] -= 1
+        if _active_ws_per_ip[ip] == 0:
+            del _active_ws_per_ip[ip]
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +403,10 @@ async def download(request: Request, hash: str):
     conn = registry.get(hash)
     if conn is None:
         raise HTTPException(status_code=404, detail="Not found")
+
+    if len(conn.pending) >= MAX_CONCURRENT_REQUESTS:
+        return _page("Too Many Requests", "Slow down",
+                     "Too many concurrent downloads for this file. Try again in a moment.", 429)
 
     request_id = uuid.uuid4().hex  # 32 ASCII hex chars — fits REQUEST_ID_BYTES
     queue: asyncio.Queue = asyncio.Queue()
@@ -395,11 +437,12 @@ async def download(request: Request, hash: str):
         raise HTTPException(status_code=503, detail="Unexpected response from desktop")
 
     meta = msg
-    safe_name = "".join(
-        c for c in meta.filename if ord(c) >= 0x20 and c not in '"\\'
+    safe_ascii = "".join(
+        c for c in meta.filename if 0x20 <= ord(c) < 0x7F and c not in '"\\;'
     ) or "download"
+    encoded_name = quote(meta.filename, safe="")
     logger.info("streaming hash=%s filename=%r size=%d to=%s",
-                hash, safe_name, meta.size, client_host)
+                hash, safe_ascii, meta.size, client_host)
 
     async def stream_chunks():
         try:
@@ -422,7 +465,7 @@ async def download(request: Request, hash: str):
         stream_chunks(),
         media_type="application/octet-stream",
         headers={
-            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "Content-Disposition": f'attachment; filename="{safe_ascii}"; filename*=UTF-8\'\'{encoded_name}',
             "Content-Length": str(meta.size),
         },
     )
