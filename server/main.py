@@ -315,6 +315,9 @@ async def ws_endpoint(ws: WebSocket):
 
                 if row is not None and row[0] == client_id:
                     registry.add(conn, hash_val)
+                    await ws.send_text(protocol.encode(
+                        protocol.Assigned(filename=filename, hash=hash_val)
+                    ))
                 else:
                     new_hash = await _generate_hash(db)
                     await db.execute(

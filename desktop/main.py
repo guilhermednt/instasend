@@ -140,7 +140,8 @@ def _make_tray_icon() -> QIcon:
 class _Signals(QObject):
     download_updated = Signal(str, int)   # local_id, count
     share_assigned   = Signal(str, str)   # local_id, server_hash
-    ws_status        = Signal(str)        # "connected" | "reconnecting" | "no_server"
+    ws_status        = Signal(str)        # "connected" | "reconnecting" | "no_server" | "auth_failed"
+    auth_failed      = Signal()
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +161,7 @@ class SetupDialog(QDialog):
     )
     _LABEL_STYLE = "color: #a6adc8; font-size: 12px; margin-top: 4px;"
 
-    def __init__(self, parent=None):
+    def __init__(self, server_url: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("InstaSend — Server Setup")
         self.setFixedWidth(460)
@@ -174,6 +175,8 @@ class SetupDialog(QDialog):
         title.setStyleSheet("font-size: 20px; font-weight: bold; color: #cdd6f4;")
 
         desc = QLabel(
+            "Authentication failed. Enter the correct token for your server."
+            if server_url else
             "Enter the details for your InstaSend relay server.\n"
             "Contact your server administrator for the token."
         )
@@ -228,6 +231,9 @@ class SetupDialog(QDialog):
         layout.addWidget(self._token_input)
         layout.addLayout(buttons)
 
+        if server_url:
+            self._url_input.setText(server_url)
+
         self._url_input.textChanged.connect(self._update_save_btn)
         self._token_input.textChanged.connect(self._update_save_btn)
         self._update_save_btn()
@@ -258,11 +264,13 @@ class StatusBar(QWidget):
         "connected":    "#a6e3a1",  # green
         "reconnecting": "#f9e2af",  # yellow
         "no_server":    "#585b70",  # muted grey
+        "auth_failed":  "#f38ba8",  # red
     }
     _LABELS = {
         "connected":    "Connected",
         "reconnecting": "Reconnecting…",
         "no_server":    "No server configured",
+        "auth_failed":  "Authentication failed",
     }
 
     def __init__(self, parent=None):
@@ -554,6 +562,7 @@ class InstaSend:
         self._signals.download_updated.connect(self._share_list.update_count)
         self._signals.share_assigned.connect(self._on_share_assigned)
         self._signals.ws_status.connect(self._popup.set_status)
+        self._signals.auth_failed.connect(self._on_auth_failed)
 
         self._tray = QSystemTrayIcon(_make_tray_icon(), self.qt_app)
         self._tray.setToolTip("InstaSend")
@@ -584,6 +593,7 @@ class InstaSend:
                 on_assigned=self._manager.assign,
                 on_download=self._manager.record_download,
                 on_status=self._on_ws_status,
+                on_auth_failed=lambda: self._signals.auth_failed.emit(),
             )
 
     def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason):
@@ -641,6 +651,20 @@ class InstaSend:
 
     def _on_ws_status(self, status: str):
         self._signals.ws_status.emit(status)
+
+    def _on_auth_failed(self):
+        self._ws_client = None  # the loop has already stopped
+        self._popup.set_status("auth_failed")
+        self._show_popup()
+
+        dialog = SetupDialog(server_url=self.config.get("server_url", ""))
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.config["server_url"] = dialog.server_url()
+            self.config["token"] = dialog.token()
+            _save_config(self.config)
+            self._maybe_create_ws_client()
+            if self._ws_client:
+                self._ws_client.start()
 
     def run(self) -> int:
         self._manager.load()

@@ -39,6 +39,7 @@ class WsClient:
         on_assigned,            # (filename: str, server_hash: str) → None
         on_download,            # (hash_val: str) → None
         on_status,              # (status: str) → None  "connected" | "reconnecting"
+        on_auth_failed=None,    # () → None  called once on 4001, then loop stops
     ):
         self._url = url
         self._token = token
@@ -48,6 +49,7 @@ class WsClient:
         self._on_assigned = on_assigned
         self._on_download = on_download
         self._on_status = on_status
+        self._on_auth_failed = on_auth_failed
 
         self._loop = asyncio.new_event_loop()
         self._ws = None  # set only while a session is live
@@ -79,12 +81,13 @@ class WsClient:
                     finally:
                         self._ws = None
             except websockets.exceptions.ConnectionClosedError as exc:
-                if exc.code in (4001, 4003):
-                    # Configuration errors — slow down retries and log clearly
-                    logger.error(
-                        "ws rejected (code %d: %s) — check server URL and token",
-                        exc.code, exc.reason,
-                    )
+                if exc.code == 4001:
+                    logger.error("ws auth rejected — bad token")
+                    if self._on_auth_failed:
+                        self._on_auth_failed()
+                    return  # stop the loop; caller must create a new WsClient
+                elif exc.code == 4003:
+                    logger.error("ws rejected: protocol version mismatch — update the app")
                     backoff = 120
                 else:
                     logger.warning("ws closed (code %d), retry in %ds", exc.code, backoff)
