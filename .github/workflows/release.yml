@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: instasend-macos.zip
+          - os: ubuntu-latest
+            artifact: instasend-linux.tar.gz
+          - os: windows-latest
+            artifact: instasend-windows.zip
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r desktop/requirements.txt -r desktop/requirements-dev.txt
+
+      - name: Build (macOS / Windows)
+        if: runner.os != 'Linux'
+        working-directory: desktop
+        run: python build.py
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        working-directory: desktop
+        run: |
+          sudo apt-get install -y xvfb
+          xvfb-run python build.py
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: cd desktop/dist && zip -r ../../instasend-macos.zip instasend.app
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: cd desktop/dist && tar -czf ../../instasend-linux.tar.gz instasend/
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path desktop/dist/instasend -DestinationPath instasend-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
