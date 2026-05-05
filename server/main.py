@@ -288,6 +288,7 @@ async def ws_endpoint(ws: WebSocket):
             return
 
         if not TOKEN or not hmac.compare_digest(msg.token, TOKEN):
+            logger.warning("ws auth failed client_id=%s ip=%s", msg.client_id[:8], ip)
             await ws.close(code=4001, reason="Authentication failed")
             return
 
