@@ -230,7 +230,7 @@ async def rate_limit_handler(request: Request, _exc):
 @app.exception_handler(404)
 async def not_found_handler(request: Request, _exc):
     return _page("Not Found", "File not found",
-                 "This link has expired or was never created. Ask the sender for a new one.", 404)
+                 "This link has expired or was never created.<br/>Ask the sender for a new one.", 404)
 
 
 @app.exception_handler(503)
