@@ -39,7 +39,7 @@ from ws_client import WsClient
 DEFAULT_CONFIG = {"server_url": "", "public_url": "", "token": ""}
 
 APP_DIR = Path.home() / ".instasend"
-APP_DIR.mkdir(exist_ok=True)
+APP_DIR.mkdir(mode=0o700, exist_ok=True)
 
 CONFIG_PATH = APP_DIR / "config.json"
 SHARES_PATH = APP_DIR / "shares.json"
