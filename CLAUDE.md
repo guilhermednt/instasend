@@ -24,6 +24,8 @@ pip install -r requirements.txt
 TOKEN=my-secret uvicorn main:app --reload
 ```
 
+`TOKEN` must be at least 32 characters. Generate one with `openssl rand -hex 32`.
+
 ## Running the desktop app
 
 ```bash
@@ -49,7 +51,7 @@ Output is in `desktop/dist/`. On macOS: `instasend.app`.
 
 ### Data flow
 
-1. Desktop connects to `wss://server/ws`, sends a `Register` frame with all known hashes and `client_id`.
+1. Desktop connects to `wss://server/ws`. Server immediately sends a `Challenge(nonce, server_digest)` where `server_digest = HMAC-SHA256(token, "server:" + nonce)`. Desktop verifies `server_digest` to confirm the server knows the token (guards against MitM), then replies with `Register(digest, client_id, hashes)` where `digest = HMAC-SHA256(token, "client:" + nonce)`. The token itself is never transmitted.
 2. User drops a file → desktop sends `Add(filename)` → server responds with `Assigned(filename, hash)` → desktop stores the server-assigned hash.
 3. Someone visits `https://server/<hash>` → server sends `Request(request_id, hash)` to desktop over WebSocket → desktop streams `Response` + binary chunks → server pipes them to the HTTP client as a `StreamingResponse`.
 4. Multiple concurrent downloads are multiplexed on the single WebSocket connection using `request_id`.
@@ -58,15 +60,15 @@ Output is in `desktop/dist/`. On macOS: `instasend.app`.
 
 Four source files:
 
-- **`main.py`** — UI and wiring. `PopupWindow` is a frameless `QWidget` (not `Tool` window, so DnD works). `ShareList` manages `ShareRow` widgets keyed by `local_id`. `InstaSend` creates all components and drives the Qt event loop. On first run (no token), shows `SetupDialog`. Status bar in popup footer shows `Connected / Reconnecting… / No server configured`.
-- **`ws_client.py`** — `WsClient` runs its own asyncio event loop in a daemon thread. Sends `Register` on connect, `Add` for pending shares, handles incoming `Assigned` and `Request` frames. Serves files concurrently via `asyncio.create_task`. Reconnects with exponential backoff (1 s → 60 s). Thread-safe `send_add()` / `send_remove()` API for the Qt thread.
-- **`shares.py`** — `ShareManager` owns the share dict keyed by `local_id` (a UUID), with a secondary `_hash_index` (server_hash → local_id). `add()` creates a pending share with `hash=None`; `assign(filename, server_hash)` wires it up when the server responds. `remove(local_id)` returns the server hash for the WS `Remove` frame. Persists to `~/.instasend/shares.json` (list format; auto-migrates old dict format).
-- **`protocol.py`** — shared with `server/`. Dataclasses + encode/decode for all control frames and binary chunk framing.
+- **`main.py`** — UI and wiring. `PopupWindow` is a frameless `QWidget` (not `Tool` window, so DnD works). `ShareList` manages `ShareRow` widgets keyed by `local_id`. `InstaSend` creates all components and drives the Qt event loop. On first run (no token), shows `SetupDialog`. Status bar in popup footer shows `Connected / Reconnecting… / No server configured / Authentication failed`. On auth failure (4001 from server, or bad server digest), re-shows `SetupDialog` pre-filled with the current server URL.
+- **`ws_client.py`** — `WsClient` runs its own asyncio event loop in a daemon thread. On connect: receives `Challenge`, verifies server digest (raises `_ServerAuthFailed` and calls `on_auth_failed` if it fails), then sends `Register` with HMAC digest. Sends `Add` for pending shares. Handles incoming `Assigned` and `Request` frames. Serves files concurrently via `asyncio.create_task`. Reconnects with exponential backoff (1 s → 60 s). Stops permanently on auth failure (4001 or `_ServerAuthFailed`). Thread-safe `send_add()` / `send_remove()` API for the Qt thread.
+- **`shares.py`** — `ShareManager` owns the share dict keyed by `local_id` (a UUID), with a secondary `_hash_index` (server_hash → local_id). `add()` creates a pending share with `hash=None`; `assign(filename, server_hash)` wires it up — fast path if the hash is already in the index (reconnect echo), otherwise finds the first pending share by filename (new assignment), otherwise updates an existing share's hash (reconnect reassignment). `remove(local_id)` returns the server hash for the WS `Remove` frame. Persists to `~/.instasend/shares.json` (list format; auto-migrates old dict format).
+- **`protocol.py`** — shared with `server/`. Dataclasses + encode/decode for all control frames and binary chunk framing. Includes `auth_digest(token, message)` helper (HMAC-SHA256). `PROTOCOL_VERSION = 2`. Keep both copies in sync; bump the version on any breaking change.
 
 ### Server (`server/`)
 
 Single file `main.py` — FastAPI app with:
-- `GET /ws` — WebSocket endpoint. Validates token and protocol version on the first `Register` frame. Handles `Add` / `Remove` frames to keep the live registry up to date. Generates server-side hashes (8-char alphanumeric, checked against the ownership DB so retired hashes are never reused). Sends `Assigned` when a hash is created.
+- `GET /ws` — WebSocket endpoint. Sends `Challenge` immediately on connect. Validates client's HMAC digest and protocol version on the `Register` frame. Handles `Add` / `Remove` frames to keep the live registry up to date. Generates server-side hashes (8-char alphanumeric, checked against the ownership DB so retired hashes are never reused). Sends `Assigned` when a hash is created or confirmed.
 - `GET /{hash}` — HTTP download endpoint. Sends a `Request` frame to the desktop, awaits `Response` metadata, then streams binary chunks back to the HTTP client as a `StreamingResponse`. Concurrent downloads are multiplexed by `request_id`.
 - `shares(hash, client_id, filename)` — SQLite ownership table (via aiosqlite). Hashes are never deleted from the DB; they stay retired forever so they can't be reassigned to a different `client_id`.
 
@@ -80,13 +82,13 @@ Each desktop generates a random `client_id` on first run and stores it in `~/.in
 |---|---|---|
 | `server_url` | `""` | Relay server base URL (e.g. `https://dl.666.fail`) |
 | `public_url` | `""` | Optional override for the public-facing URL shown in share links |
-| `token` | `""` | Pre-shared secret — must match the server's `TOKEN` env var. Never bundled with the app. |
+| `token` | `""` | Pre-shared secret — must match the server's `TOKEN` env var. Used locally to compute HMAC digests; never transmitted. |
 
 ## Server environment variables (`.env`)
 
 | Variable | Description |
 |---|---|
-| `TOKEN` | Pre-shared secret the desktop must present in the `Register` frame |
+| `TOKEN` | Pre-shared secret (minimum 32 characters). Used to verify HMAC challenge-response digests. Never transmitted over the wire. |
 | `DB_PATH` | SQLite database path (default `shares.db`; use `/data/shares.db` in Docker) |
 | `FORWARDED_ALLOW_IPS` | IP of the reverse proxy whose `X-Forwarded-For` headers are trusted |
 
