@@ -118,10 +118,10 @@ async def _generate_hash(db: aiosqlite.Connection) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not TOKEN or TOKEN == "change-me":
+    if not TOKEN or len(TOKEN) < 32:
         raise RuntimeError(
-            "TOKEN env var is not set or is the default placeholder — "
-            "set a strong token before starting the server"
+            "TOKEN must be at least 32 characters — "
+            "generate one with: openssl rand -hex 32"
         )
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -268,7 +268,16 @@ async def ws_endpoint(ws: WebSocket):
         return
     _active_ws_per_ip[ip] = _active_ws_per_ip.get(ip, 0) + 1
     try:
-        # First frame must be register, received within 10 s
+        # Mutual challenge-response: server signs the nonce so the client can
+        # verify it is talking to a legitimate server (guards against MitM),
+        # and the client signs it to prove it knows the token without sending it.
+        nonce = secrets.token_hex(32)
+        await ws.send_text(protocol.encode(protocol.Challenge(
+            nonce=nonce,
+            server_digest=protocol.auth_digest(TOKEN, "server:" + nonce),
+        )))
+
+        # Client must respond with a Register frame within 10 s
         try:
             raw = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
             msg = protocol.decode(raw)
@@ -287,7 +296,8 @@ async def ws_endpoint(ws: WebSocket):
             await ws.close(code=4003, reason="Protocol version mismatch")
             return
 
-        if not TOKEN or not hmac.compare_digest(msg.token, TOKEN):
+        expected = protocol.auth_digest(TOKEN, "client:" + nonce)
+        if not hmac.compare_digest(msg.digest, expected):
             logger.warning("ws auth failed client_id=%s ip=%s", msg.client_id[:8], ip)
             await ws.close(code=4001, reason="Authentication failed")
             return
@@ -307,6 +317,10 @@ async def ws_endpoint(ws: WebSocket):
             for entry in msg.hashes:
                 hash_val = entry["hash"]
                 filename = entry["filename"]
+
+                if len(filename.encode()) > 255:
+                    await ws.close(code=4002, reason="Filename too long")
+                    return
 
                 async with db.execute(
                     "SELECT client_id FROM shares WHERE hash = ?", (hash_val,)
@@ -350,6 +364,9 @@ async def ws_endpoint(ws: WebSocket):
                     if isinstance(msg, protocol.Add):
                         if len(conn.hashes) >= MAX_HASHES_PER_CLIENT:
                             await ws.close(code=4002, reason="Too many active shares")
+                            return
+                        if len(msg.filename.encode()) > 255:
+                            await ws.close(code=4002, reason="Filename too long")
                             return
                         async with aiosqlite.connect(DB_PATH) as db:
                             new_hash = await _generate_hash(db)

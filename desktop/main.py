@@ -65,7 +65,12 @@ def _get_version() -> str:
 def load_config() -> dict:
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH) as f:
-            return {**DEFAULT_CONFIG, **json.load(f)}
+            config = {**DEFAULT_CONFIG, **json.load(f)}
+        try:
+            CONFIG_PATH.chmod(0o600)
+        except OSError:
+            pass
+        return config
     return DEFAULT_CONFIG.copy()
 
 

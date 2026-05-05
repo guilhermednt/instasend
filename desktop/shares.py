@@ -102,32 +102,40 @@ class ShareManager:
         """
         Called when the server sends an Assigned frame.
 
-        Matches by filename — a pending share (hash=None) wins over an existing
-        one so that newly added files are wired up first.  Falls back to updating
-        an existing share's hash (reconnect reassignment scenario).
+        Fast path: if the hash is already in the index the server echoed back a
+        hash we already own (valid reconnect) — just fire the callback.
+
+        Otherwise: find the first pending share (hash=None) with this filename
+        (new assignment, consumed in insertion order so duplicate filenames are
+        handled correctly).  If no pending share exists, this is a reconnect
+        reassignment — update the first matching share's hash.
         """
         local_id = None
         with self._lock:
-            # Prefer a pending share with no hash yet
-            for lid, share in self._shares.items():
-                if share["filename"] == filename and share.get("hash") is None:
-                    share["hash"] = server_hash
-                    self._hash_index[server_hash] = lid
-                    local_id = lid
-                    self._save_locked()
-                    break
+            # Reconnect confirmation: server echoed a hash we already have.
+            if server_hash in self._hash_index:
+                local_id = self._hash_index[server_hash]
             else:
-                # Reconnect reassignment: update an existing share's hash
+                # New assignment: consume the first pending share with this filename.
                 for lid, share in self._shares.items():
-                    if share["filename"] == filename:
-                        old_hash = share.get("hash")
-                        if old_hash:
-                            self._hash_index.pop(old_hash, None)
+                    if share["filename"] == filename and share.get("hash") is None:
                         share["hash"] = server_hash
                         self._hash_index[server_hash] = lid
                         local_id = lid
                         self._save_locked()
                         break
+                else:
+                    # Reconnect reassignment: server retired the old hash.
+                    for lid, share in self._shares.items():
+                        if share["filename"] == filename:
+                            old_hash = share.get("hash")
+                            if old_hash:
+                                self._hash_index.pop(old_hash, None)
+                            share["hash"] = server_hash
+                            self._hash_index[server_hash] = lid
+                            local_id = lid
+                            self._save_locked()
+                            break
 
         if local_id and self._on_assigned:
             self._on_assigned(local_id, server_hash)

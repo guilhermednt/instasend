@@ -14,7 +14,9 @@ Reconnects automatically with exponential backoff (1 s → 2 s → … → 60 s)
 """
 
 import asyncio
+import hmac
 import logging
+import os
 import threading
 from pathlib import Path
 
@@ -22,6 +24,10 @@ from websockets.asyncio.client import connect
 import websockets.exceptions
 
 import protocol
+
+
+class _ServerAuthFailed(Exception):
+    pass
 
 CHUNK_SIZE = 256 * 1024  # 256 KB per chunk
 
@@ -80,6 +86,8 @@ class WsClient:
                         await self._session(ws)
                     finally:
                         self._ws = None
+            except _ServerAuthFailed:
+                return  # on_auth_failed already called inside _session
             except websockets.exceptions.ConnectionClosedError as exc:
                 if exc.code == 4001:
                     logger.error("ws auth rejected — bad token")
@@ -102,16 +110,47 @@ class WsClient:
             backoff = min(backoff * 2, 60)
 
     async def _session(self, ws):
-        """One connected session: register, then handle frames until disconnect."""
+        """One connected session: mutual auth, register, then handle frames."""
+        # Receive and verify the server's challenge.
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("ws challenge timed out")
+            return
+
+        if not isinstance(raw, str):
+            logger.warning("ws expected text challenge, got binary frame")
+            return
+
+        try:
+            challenge = protocol.decode(raw)
+        except ValueError as exc:
+            logger.warning("ws malformed challenge: %s", exc)
+            return
+
+        if not isinstance(challenge, protocol.Challenge):
+            logger.warning("ws expected challenge, got %s", type(challenge).__name__)
+            return
+
+        # Verify server knows the token — reject rogue servers / MitM.
+        expected_server = protocol.auth_digest(self._token, "server:" + challenge.nonce)
+        if not hmac.compare_digest(challenge.server_digest, expected_server):
+            logger.error("ws server authentication failed — possible MitM or wrong token on server")
+            if self._on_auth_failed:
+                self._on_auth_failed()
+            raise _ServerAuthFailed()
+
+        # Prove we know the token by signing the nonce — token never sent in the clear.
         shares = self._get_shares()
         hashes = [
             {"hash": s["hash"], "filename": s["filename"]}
             for s in shares if s.get("hash")
         ]
+        client_digest = protocol.auth_digest(self._token, "client:" + challenge.nonce)
         await ws.send(protocol.encode(protocol.Register(
             version=protocol.PROTOCOL_VERSION,
-            token=self._token,
             client_id=self._client_id,
+            digest=client_digest,
             hashes=hashes,
         )))
 
@@ -157,14 +196,14 @@ class WsClient:
             return
 
         try:
-            size = path.stat().st_size
-            await ws.send(protocol.encode(protocol.Response(
-                request_id=req.request_id,
-                status=200,
-                filename=share["filename"],
-                size=size,
-            )))
             with open(path, "rb") as f:
+                size = os.fstat(f.fileno()).st_size
+                await ws.send(protocol.encode(protocol.Response(
+                    request_id=req.request_id,
+                    status=200,
+                    filename=share["filename"],
+                    size=size,
+                )))
                 while chunk := f.read(CHUNK_SIZE):
                     await ws.send(protocol.encode_chunk(req.request_id, chunk))
         except Exception as exc:
