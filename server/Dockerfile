@@ -9,9 +9,11 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py entrypoint.sh ./
+COPY main.py protocol.py entrypoint.sh ./
 RUN chmod +x entrypoint.sh \
-    && adduser --disabled-password --gecos "" appuser
+    && adduser --disabled-password --gecos "" appuser \
+    && mkdir -p /data \
+    && chown appuser:appuser /data
 
 EXPOSE 8000
 

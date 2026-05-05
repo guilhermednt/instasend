@@ -1,18 +1,21 @@
-import ipaddress
+import asyncio
 import logging
 import os
+import secrets
+import string
+import uuid
 from contextlib import asynccontextmanager
 
 import aiosqlite
-import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, StreamingResponse
-from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
+
+import protocol
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -77,10 +80,98 @@ def _page(title: str, heading: str, body: str, status_code: int = 200) -> HTMLRe
 # Config
 # ---------------------------------------------------------------------------
 
-DB_PATH = os.environ.get("DB_PATH", "shares.db")
-INTERNAL_NETWORK = ipaddress.IPv4Network(
-    os.environ.get("INTERNAL_NETWORK", "10.0.0.0/24")
-)
+DB_PATH = os.environ.get("DB_PATH", "/data/shares.db")
+TOKEN   = os.environ.get("TOKEN", "")
+
+# ---------------------------------------------------------------------------
+# Hash generation
+# ---------------------------------------------------------------------------
+
+_HASH_CHARS = string.ascii_letters + string.digits
+_HASH_LEN   = 8  # 62^8 ≈ 218 trillion combinations
+
+
+async def _generate_hash(db: aiosqlite.Connection) -> str:
+    """Return a random hash that has never appeared in the ownership DB."""
+    while True:
+        h = "".join(secrets.choice(_HASH_CHARS) for _ in range(_HASH_LEN))
+        async with db.execute("SELECT 1 FROM shares WHERE hash = ?", (h,)) as cur:
+            if await cur.fetchone() is None:
+                return h
+
+
+# ---------------------------------------------------------------------------
+# Ownership DB (persistent) + in-memory live registry
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS shares (
+                hash      TEXT PRIMARY KEY,
+                client_id TEXT NOT NULL,
+                filename  TEXT NOT NULL
+            )
+        """)
+        await db.commit()
+    yield
+
+
+class Connection:
+    """Represents one live desktop client."""
+
+    def __init__(self, ws: WebSocket, client_id: str):
+        self.ws = ws
+        self.client_id = client_id
+        self.hashes: set[str] = set()
+        # request_id → asyncio.Queue — populated by the download handler (S4)
+        self.pending: dict[str, asyncio.Queue] = {}
+
+    def dispatch(self, msg):
+        """Route a Response or Error frame to its waiting download queue."""
+        request_id = getattr(msg, "request_id", None)
+        if request_id and request_id in self.pending:
+            self.pending[request_id].put_nowait(msg)
+
+    def dispatch_chunk(self, data: bytes):
+        """Route a binary chunk frame to its waiting download queue."""
+        request_id, chunk = protocol.decode_chunk(data)
+        if request_id in self.pending:
+            self.pending[request_id].put_nowait(chunk)
+
+
+class Registry:
+    def __init__(self):
+        self._hash_to_conn: dict[str, Connection] = {}
+        self._connections: set[Connection] = set()
+
+    def connect(self, ws: WebSocket, client_id: str) -> Connection:
+        conn = Connection(ws, client_id)
+        self._connections.add(conn)
+        return conn
+
+    def add(self, conn: Connection, hash_val: str):
+        conn.hashes.add(hash_val)
+        self._hash_to_conn[hash_val] = conn
+
+    def remove(self, conn: Connection, hash_val: str):
+        conn.hashes.discard(hash_val)
+        if self._hash_to_conn.get(hash_val) is conn:
+            del self._hash_to_conn[hash_val]
+
+    def disconnect(self, conn: Connection):
+        self._connections.discard(conn)
+        for h in list(conn.hashes):
+            if self._hash_to_conn.get(h) is conn:
+                del self._hash_to_conn[h]
+        conn.hashes.clear()
+
+    def get(self, hash_val: str) -> Connection | None:
+        return self._hash_to_conn.get(hash_val)
+
+
+registry = Registry()
 
 # ---------------------------------------------------------------------------
 # Rate limiter
@@ -91,22 +182,6 @@ limiter = Limiter(key_func=get_remote_address)
 # ---------------------------------------------------------------------------
 # App + middleware
 # ---------------------------------------------------------------------------
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS shares (
-                hash     TEXT PRIMARY KEY,
-                client_ip TEXT NOT NULL,
-                port     INTEGER NOT NULL,
-                filename TEXT NOT NULL
-            )
-        """)
-        await db.commit()
-    yield
-
 
 app = FastAPI(lifespan=lifespan)
 app.state.limiter = limiter
@@ -122,59 +197,31 @@ class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(_SecurityHeadersMiddleware)
 
-
 # ---------------------------------------------------------------------------
 # Exception handlers
 # ---------------------------------------------------------------------------
 
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, _exc):
-    return _page(
-        title="Too Many Requests",
-        heading="Slow down",
-        body="Too many requests. Please try again in a moment.",
-        status_code=429,
-    )
+    return _page("Too Many Requests", "Slow down",
+                 "Too many requests. Please try again in a moment.", 429)
 
 
 @app.exception_handler(404)
 async def not_found_handler(request: Request, _exc):
-    return _page(
-        title="Not Found",
-        heading="File not found",
-        body="This link has expired or was never created. Ask the sender for a new one.",
-        status_code=404,
-    )
-
-
-@app.exception_handler(403)
-async def forbidden_handler(request: Request, _exc):
-    return _page(
-        title="Forbidden",
-        heading="Access denied",
-        body="This action is only available from the local network.",
-        status_code=403,
-    )
+    return _page("Not Found", "File not found",
+                 "This link has expired or was never created. Ask the sender for a new one.", 404)
 
 
 @app.exception_handler(503)
 async def unavailable_handler(request: Request, _exc):
-    return _page(
-        title="Unavailable",
-        heading="File temporarily unavailable",
-        body="The host machine is offline or the InstaSend app is not running. Try again later.",
-        status_code=503,
-    )
+    return _page("Unavailable", "File temporarily unavailable",
+                 "The host machine is offline or the InstaSend app is not running. Try again later.", 503)
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_handler(request: Request, _exc):
-    return _page(
-        title="Bad Request",
-        heading="Bad request",
-        body="The request could not be understood.",
-        status_code=400,
-    )
+    return _page("Bad Request", "Bad request", "The request could not be understood.", 400)
 
 
 # ---------------------------------------------------------------------------
@@ -183,129 +230,199 @@ async def validation_handler(request: Request, _exc):
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return _page(
-        title="InstaSend",
-        heading="InstaSend",
-        body="Drop a file into the InstaSend app to generate a share link.",
-    )
+    return _page("InstaSend", "InstaSend",
+                 "Drop a file into the InstaSend app to generate a share link.")
 
 
 # ---------------------------------------------------------------------------
-# Internal-network guard
+# WebSocket endpoint
 # ---------------------------------------------------------------------------
 
-def require_internal(request: Request):
-    """Dependency that rejects requests from outside INTERNAL_NETWORK."""
-    raw = request.client.host if request.client else ""
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+
+    # First frame must be register, received within 10 s
     try:
-        ip = ipaddress.IPv4Address(raw)
+        raw = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
+        msg = protocol.decode(raw)
+    except asyncio.TimeoutError:
+        await ws.close(code=4002, reason="Registration timeout")
+        return
     except ValueError:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    if ip not in INTERNAL_NETWORK:
-        raise HTTPException(status_code=403, detail="Forbidden")
+        await ws.close(code=4002, reason="Protocol error")
+        return
 
+    if not isinstance(msg, protocol.Register):
+        await ws.close(code=4002, reason="Expected register message")
+        return
 
-# ---------------------------------------------------------------------------
-# Management endpoints (internal only)
-# ---------------------------------------------------------------------------
-
-class ShareIn(BaseModel):
-    hash: str
-    port: int = Field(..., ge=1, le=65535)  # fix 10: validated port range
-    filename: str
-
-
-@app.post("/shares", status_code=201, dependencies=[Depends(require_internal)])
-async def register_share(body: ShareIn, request: Request):
-    """Register (or update) a share. Client IP is read from the connection."""
-    client_ip = request.client.host
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO shares (hash, client_ip, port, filename)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(hash) DO UPDATE SET
-                client_ip = excluded.client_ip,
-                port      = excluded.port,
-                filename  = excluded.filename
-            """,
-            (body.hash, client_ip, body.port, body.filename),
+    if msg.version != protocol.PROTOCOL_VERSION:
+        await ws.close(
+            code=4003,
+            reason=f"Protocol version mismatch: server={protocol.PROTOCOL_VERSION} client={msg.version}",
         )
-        await db.commit()
-    logger.info("registered share hash=%s ip=%s port=%d filename=%r",
-                body.hash, client_ip, body.port, body.filename)
-    return {"hash": body.hash, "client_ip": client_ip}
+        return
 
+    if not TOKEN or msg.token != TOKEN:
+        await ws.close(code=4001, reason="Authentication failed")
+        return
 
-@app.delete("/shares/{hash}", status_code=204, dependencies=[Depends(require_internal)])
-async def delete_share(hash: str, request: Request):
-    """Remove a share entirely. Future GET requests for this hash return 404."""
+    client_id = msg.client_id
+    conn = registry.connect(ws, client_id)
+
+    # Validate ownership of each stored hash.
+    # Hashes owned by this client are re-registered in the live registry.
+    # Any hash that is unrecognised or owned by a different client is retired
+    # and a fresh one is assigned — the desktop is notified via `assigned`.
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM shares WHERE hash = ?", (hash,))
-        await db.commit()
-    logger.info("deleted share hash=%s by=%s", hash,
-                request.client.host if request.client else "unknown")
+        for entry in msg.hashes:
+            hash_val = entry["hash"]
+            filename = entry["filename"]
+
+            async with db.execute(
+                "SELECT client_id FROM shares WHERE hash = ?", (hash_val,)
+            ) as cur:
+                row = await cur.fetchone()
+
+            if row is not None and row[0] == client_id:
+                registry.add(conn, hash_val)
+            else:
+                new_hash = await _generate_hash(db)
+                await db.execute(
+                    "INSERT INTO shares (hash, client_id, filename) VALUES (?, ?, ?)",
+                    (new_hash, client_id, filename),
+                )
+                await db.commit()
+                registry.add(conn, new_hash)
+                await ws.send_text(protocol.encode(
+                    protocol.Assigned(filename=filename, hash=new_hash)
+                ))
+                logger.info("ws reassigned %s → %s client=%s", hash_val, new_hash, client_id[:8])
+
+    logger.info("ws connected client=%s hashes=%d", client_id[:8], len(conn.hashes))
+
+    try:
+        while True:
+            frame = await ws.receive()
+
+            if frame["type"] == "websocket.disconnect":
+                break
+
+            if frame.get("text"):
+                try:
+                    msg = protocol.decode(frame["text"])
+                except ValueError:
+                    await ws.close(code=4002, reason="Protocol error")
+                    return
+
+                if isinstance(msg, protocol.Add):
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        new_hash = await _generate_hash(db)
+                        await db.execute(
+                            "INSERT INTO shares (hash, client_id, filename) VALUES (?, ?, ?)",
+                            (new_hash, client_id, msg.filename),
+                        )
+                        await db.commit()
+                    registry.add(conn, new_hash)
+                    await ws.send_text(protocol.encode(
+                        protocol.Assigned(filename=msg.filename, hash=new_hash)
+                    ))
+                    logger.info("ws add hash=%s client=%s", new_hash, client_id[:8])
+
+                elif isinstance(msg, protocol.Remove):
+                    registry.remove(conn, msg.hash)
+                    # Hash is intentionally kept in DB so it can never be
+                    # reassigned to a different client.
+                    logger.info("ws remove hash=%s", msg.hash)
+
+                else:
+                    # Response / Error frames: routed to download handler (S4)
+                    conn.dispatch(msg)
+
+            elif frame.get("bytes"):
+                # Binary chunk frames: routed to download handler (S4)
+                conn.dispatch_chunk(frame["bytes"])
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        logger.info("ws disconnected client=%s released %d hashes",
+                    client_id[:8], len(conn.hashes))
+        registry.disconnect(conn)
 
 
 # ---------------------------------------------------------------------------
-# Public download endpoint
+# Public download endpoint — stubbed pending S4
 # ---------------------------------------------------------------------------
-
-# Allowlist of upstream headers safe to forward (fix 2: replaces hop-by-hop blocklist)
-_UPSTREAM_HEADER_ALLOWLIST = {"content-disposition", "content-length", "last-modified", "etag"}
-
-PROXY_TIMEOUT = httpx.Timeout(10.0, read=None)  # no read timeout for large files
-
 
 @app.get("/{hash}")
-@limiter.limit("30/minute")  # fix 5: rate limiting
+@limiter.limit("30/minute")
 async def download(request: Request, hash: str):
     client_host = request.client.host if request.client else "unknown"
     logger.info("download request hash=%s from=%s", hash, client_host)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT client_ip, port, filename FROM shares WHERE hash = ?", (hash,)
-        ) as cursor:
-            row = await cursor.fetchone()
-
-    if row is None:
+    conn = registry.get(hash)
+    if conn is None:
         raise HTTPException(status_code=404, detail="Not found")
 
-    client_ip, port, filename = row
-    upstream = f"http://{client_ip}:{port}/{hash}"
+    request_id = uuid.uuid4().hex  # 32 ASCII hex chars — fits REQUEST_ID_BYTES
+    queue: asyncio.Queue = asyncio.Queue()
+    conn.pending[request_id] = queue
 
-    async def stream_upstream():
-        async with httpx.AsyncClient(timeout=PROXY_TIMEOUT) as client:
-            async with client.stream("GET", upstream) as resp:
-                async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
-                    yield chunk
-
-    # Probe the upstream first to get status + headers, then stream the body.
+    # Ask the desktop to serve the file
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            head = await client.head(upstream)
-    except httpx.ConnectError:
-        logger.warning("upstream unreachable hash=%s upstream=%s", hash, upstream)
-        raise HTTPException(status_code=503, detail="File host unreachable")
-    except httpx.TimeoutException:
-        logger.warning("upstream timed out hash=%s upstream=%s", hash, upstream)
-        raise HTTPException(status_code=503, detail="File host timed out")
+        await conn.ws.send_text(protocol.encode(
+            protocol.Request(request_id=request_id, hash=hash)
+        ))
+    except Exception:
+        conn.pending.pop(request_id, None)
+        raise HTTPException(status_code=503, detail="Desktop connection lost")
 
-    if head.status_code == 404:
-        raise HTTPException(status_code=404, detail="Not found")
+    # Wait for the desktop's response frame (metadata)
+    try:
+        msg = await asyncio.wait_for(queue.get(), timeout=30.0)
+    except asyncio.TimeoutError:
+        conn.pending.pop(request_id, None)
+        raise HTTPException(status_code=503, detail="Desktop timed out")
 
-    # fix 2: forward only safe, explicitly allowed headers
-    headers = {
-        k: v for k, v in head.headers.items()
-        if k.lower() in _UPSTREAM_HEADER_ALLOWLIST
-    }
+    if isinstance(msg, protocol.Error):
+        conn.pending.pop(request_id, None)
+        raise HTTPException(status_code=404 if msg.status == 404 else 503)
 
-    logger.info("serving hash=%s to=%s", hash, client_host)
+    if not isinstance(msg, protocol.Response):
+        conn.pending.pop(request_id, None)
+        raise HTTPException(status_code=503, detail="Unexpected response from desktop")
+
+    meta = msg
+    safe_name = "".join(
+        c for c in meta.filename if ord(c) >= 0x20 and c not in '"\\'
+    ) or "download"
+    logger.info("streaming hash=%s filename=%r size=%d to=%s",
+                hash, safe_name, meta.size, client_host)
+
+    async def stream_chunks():
+        try:
+            remaining = meta.size
+            while remaining > 0:
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    logger.warning("chunk timeout hash=%s request_id=%s", hash, request_id)
+                    return
+                if not isinstance(chunk, bytes):
+                    logger.warning("expected bytes, got %s hash=%s", type(chunk), hash)
+                    return
+                yield chunk
+                remaining -= len(chunk)
+        finally:
+            conn.pending.pop(request_id, None)
 
     return StreamingResponse(
-        stream_upstream(),
-        status_code=200,
-        headers=headers,
-        media_type="application/octet-stream",  # fix 1: always force, never trust upstream
+        stream_chunks(),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "Content-Length": str(meta.size),
+        },
     )

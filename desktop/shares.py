@@ -1,47 +1,38 @@
 """
-Share management: persistence, hash generation, and Server API sync.
+Share management: persistence and local state.
 
 shares.json schema:
-{
-  "<hash>": {
-    "path":      "/absolute/path/to/file",
+[
+  {
+    "local_id":  "uuid hex",        -- stable local identifier
+    "hash":      "AbCd1234",        -- server-assigned hash; null if not yet assigned
+    "path":      "/absolute/path",
     "filename":  "display-name.ext",
     "downloads": 0
   }
-}
+]
+
+The file is automatically migrated from the old dict-keyed format on first load.
 """
 
 import json
-import secrets
-import string
 import threading
+import uuid
 from pathlib import Path
-
-import requests
-
-HASH_CHARS = string.ascii_letters + string.digits  # A-Za-z0-9
-HASH_LEN = 6
-
-
-def _generate_hash() -> str:
-    return "".join(secrets.choice(HASH_CHARS) for _ in range(HASH_LEN))
 
 
 class ShareManager:
     def __init__(
         self,
         shares_path: Path,
-        server_url: str,
-        file_server_port: int,
-        on_download=None,    # callable(hash: str, count: int) | None
-        on_registered=None,  # callable(hash: str, success: bool) | None
+        on_download=None,   # callable(local_id: str, count: int) | None
+        on_assigned=None,   # callable(local_id: str, server_hash: str) | None
     ):
         self._path = shares_path
-        self._server_url = server_url.rstrip("/") if server_url else ""
-        self._port = file_server_port
         self._on_download = on_download
-        self._on_registered = on_registered
-        self._shares: dict[str, dict] = {}
+        self._on_assigned = on_assigned
+        self._shares: dict[str, dict] = {}     # local_id → share
+        self._hash_index: dict[str, str] = {}  # server_hash → local_id
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -49,7 +40,7 @@ class ShareManager:
     # ------------------------------------------------------------------
 
     def load(self):
-        """Load shares from disk. Missing or unreadable files are dropped."""
+        """Load shares from disk. Drops entries whose file no longer exists."""
         if not self._path.exists():
             return
         try:
@@ -57,117 +48,123 @@ class ShareManager:
         except Exception:
             return
         with self._lock:
-            for h, share in data.items():
-                if Path(share.get("path", "")).is_file():
-                    self._shares[h] = share
-            # Persist back in case any stale entries were dropped
+            # Migrate old format: {hash: {path, filename, downloads}} → list
+            if isinstance(data, dict):
+                data = [
+                    {**v, "local_id": uuid.uuid4().hex, "hash": k}
+                    for k, v in data.items()
+                ]
+            for share in data:
+                if not Path(share.get("path", "")).is_file():
+                    continue
+                lid = share.get("local_id") or uuid.uuid4().hex
+                share["local_id"] = lid
+                share.setdefault("hash", None)
+                share.setdefault("downloads", 0)
+                self._shares[lid] = share
+                if share.get("hash"):
+                    self._hash_index[share["hash"]] = lid
             self._save_locked()
 
     def _save_locked(self):
-        """Write current shares to disk. Must be called with _lock held."""
+        """Write to disk. Must be called with _lock held."""
         try:
-            self._path.write_text(json.dumps(self._shares, indent=2))
+            self._path.write_text(
+                json.dumps(list(self._shares.values()), indent=2)
+            )
         except Exception:
             pass
-
-    def _save(self):
-        with self._lock:
-            self._save_locked()
 
     # ------------------------------------------------------------------
     # Share operations
     # ------------------------------------------------------------------
 
     def add(self, file_path: Path) -> dict:
-        """Register a new file. Returns the new share dict (includes hash)."""
+        """
+        Add a new file share locally (server hash not yet assigned).
+        Returns the share dict with local_id set and hash=None.
+        """
+        lid = uuid.uuid4().hex
+        share = {
+            "local_id":  lid,
+            "hash":      None,
+            "path":      str(file_path.resolve()),
+            "filename":  file_path.name,
+            "downloads": 0,
+        }
         with self._lock:
-            # Avoid hash collisions
-            h = _generate_hash()
-            while h in self._shares:
-                h = _generate_hash()
-            share = {
-                "hash":      h,
-                "path":      str(file_path.resolve()),
-                "filename":  file_path.name,
-                "downloads": 0,
-            }
-            self._shares[h] = share
+            self._shares[lid] = share
             self._save_locked()
-
-        threading.Thread(
-            target=self._server_register, args=(h, share["filename"]), daemon=True
-        ).start()
         return share
 
-    def remove(self, hash_val: str):
-        """Remove a share locally and notify the Server."""
-        with self._lock:
-            self._shares.pop(hash_val, None)
-            self._save_locked()
-        threading.Thread(
-            target=self._server_unregister, args=(hash_val,), daemon=True
-        ).start()
+    def assign(self, filename: str, server_hash: str):
+        """
+        Called when the server sends an Assigned frame.
 
-    def get(self, hash_val: str) -> dict | None:
+        Matches by filename — a pending share (hash=None) wins over an existing
+        one so that newly added files are wired up first.  Falls back to updating
+        an existing share's hash (reconnect reassignment scenario).
+        """
+        local_id = None
         with self._lock:
-            return self._shares.get(hash_val)
+            # Prefer a pending share with no hash yet
+            for lid, share in self._shares.items():
+                if share["filename"] == filename and share.get("hash") is None:
+                    share["hash"] = server_hash
+                    self._hash_index[server_hash] = lid
+                    local_id = lid
+                    self._save_locked()
+                    break
+            else:
+                # Reconnect reassignment: update an existing share's hash
+                for lid, share in self._shares.items():
+                    if share["filename"] == filename:
+                        old_hash = share.get("hash")
+                        if old_hash:
+                            self._hash_index.pop(old_hash, None)
+                        share["hash"] = server_hash
+                        self._hash_index[server_hash] = lid
+                        local_id = lid
+                        self._save_locked()
+                        break
+
+        if local_id and self._on_assigned:
+            self._on_assigned(local_id, server_hash)
+
+    def remove(self, local_id: str) -> str | None:
+        """
+        Remove a share locally.
+        Returns the server-assigned hash (to send a Remove WS frame),
+        or None if the share had not yet been assigned a hash.
+        """
+        with self._lock:
+            share = self._shares.pop(local_id, None)
+            if share is None:
+                return None
+            h = share.get("hash")
+            if h:
+                self._hash_index.pop(h, None)
+            self._save_locked()
+            return h
+
+    def get_by_hash(self, hash_val: str) -> dict | None:
+        with self._lock:
+            lid = self._hash_index.get(hash_val)
+            return self._shares.get(lid) if lid else None
 
     def all(self) -> list[dict]:
         with self._lock:
-            return [{"hash": h, **s} for h, s in self._shares.items()]
+            return list(self._shares.values())
 
     def record_download(self, hash_val: str):
+        local_id = None
         count = None
         with self._lock:
-            if hash_val in self._shares:
-                self._shares[hash_val]["downloads"] += 1
-                count = self._shares[hash_val]["downloads"]
+            lid = self._hash_index.get(hash_val)
+            if lid and lid in self._shares:
+                self._shares[lid]["downloads"] += 1
+                count = self._shares[lid]["downloads"]
+                local_id = lid
                 self._save_locked()
         if count is not None and self._on_download:
-            self._on_download(hash_val, count)
-
-    # ------------------------------------------------------------------
-    # Server API (D3)
-    # ------------------------------------------------------------------
-
-    def retry_register(self, hash_val: str):
-        """Re-attempt server registration for a single share."""
-        with self._lock:
-            share = self._shares.get(hash_val)
-        if share:
-            threading.Thread(
-                target=self._server_register, args=(hash_val, share["filename"]), daemon=True
-            ).start()
-
-    def startup_sync(self):
-        """Re-register all persisted shares with the Server after a restart."""
-        with self._lock:
-            items = list(self._shares.items())
-        for h, share in items:
-            self._server_register(h, share["filename"])
-
-    def _server_register(self, hash_val: str, filename: str):
-        if not self._server_url:
-            return
-        try:
-            r = requests.post(
-                f"{self._server_url}/shares",
-                json={"hash": hash_val, "port": self._port, "filename": filename},
-                timeout=5,
-            )
-            success = r.status_code in (200, 201)
-        except Exception:
-            success = False
-        if self._on_registered:
-            self._on_registered(hash_val, success)
-
-    def _server_unregister(self, hash_val: str):
-        if not self._server_url:
-            return
-        try:
-            requests.delete(
-                f"{self._server_url}/shares/{hash_val}",
-                timeout=5,
-            )
-        except Exception:
-            pass
+            self._on_download(local_id, count)
