@@ -5,7 +5,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPoint, Qt, Signal
+from PySide6.QtCore import QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -37,6 +37,9 @@ from shares import ShareManager
 from ws_client import WsClient
 
 DEFAULT_CONFIG = {"server_url": "", "public_url": "", "token": ""}
+
+# Must match MAX_HASHES_PER_CLIENT on the server.
+MAX_SHARES = 20
 
 APP_DIR = Path.home() / ".instasend"
 APP_DIR.mkdir(mode=0o700, exist_ok=True)
@@ -305,6 +308,34 @@ class StatusBar(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Eliding label
+# ---------------------------------------------------------------------------
+
+class _ElidedLabel(QLabel):
+    """QLabel that elides text in the middle instead of forcing a minimum width."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full_text = text
+        self.setMinimumWidth(0)
+
+    def update_text(self, text: str):
+        self._full_text = text
+        self._apply_elide()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self):
+        if self.width() > 0:
+            elided = self.fontMetrics().elidedText(
+                self._full_text, Qt.TextElideMode.ElideMiddle, self.width()
+            )
+            super().setText(elided)
+
+
+# ---------------------------------------------------------------------------
 # Share row widget
 # ---------------------------------------------------------------------------
 
@@ -329,13 +360,14 @@ class ShareRow(QFrame):
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
 
-        self.filename_label = QLabel(filename)
+        self.filename_label = _ElidedLabel(filename)
         self.filename_label.setStyleSheet(
             "color: #cdd6f4; font-size: 13px; font-weight: bold;"
         )
         self.filename_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
         )
+        self.filename_label.setToolTip(filename)
 
         self.count_label = QLabel(self._format_count(downloads))
         self.count_label.setStyleSheet("color: #cba6f7; font-size: 12px;")
@@ -455,7 +487,7 @@ class DropZone(QWidget):
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        label = QLabel("Drop a file anywhere to share")
+        label = QLabel("Drop files anywhere to share")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setStyleSheet("color: #cdd6f4; font-size: 15px; border: none;")
         layout.addWidget(label)
@@ -496,6 +528,16 @@ class PopupWindow(QWidget):
         outer.setSpacing(12)
         outer.addWidget(drop_zone)
 
+        self._limit_label = QLabel(f"Share limit reached — max {MAX_SHARES} active shares")
+        self._limit_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._limit_label.setStyleSheet("color: #f38ba8; font-size: 12px;")
+        self._limit_label.setVisible(False)
+        outer.addWidget(self._limit_label)
+
+        self._limit_timer = QTimer(self)
+        self._limit_timer.setSingleShot(True)
+        self._limit_timer.timeout.connect(lambda: self._limit_label.setVisible(False))
+
         scroll = QScrollArea()
         scroll.setWidget(share_list)
         scroll.setWidgetResizable(True)
@@ -517,10 +559,13 @@ class PopupWindow(QWidget):
     def set_status(self, status: str):
         self._status_bar.set_status(status)
 
+    def show_limit_error(self):
+        self._limit_label.setVisible(True)
+        self._limit_timer.start(4000)
+
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
-            urls = event.mimeData().urls()
-            if urls and urls[0].isLocalFile():
+            if any(u.isLocalFile() for u in event.mimeData().urls()):
                 event.acceptProposedAction()
                 self._drop_zone.set_hover()
                 return
@@ -531,11 +576,11 @@ class PopupWindow(QWidget):
 
     def dropEvent(self, event: QDropEvent):
         self._drop_zone.set_idle()
-        urls = event.mimeData().urls()
-        if urls:
-            path = Path(urls[0].toLocalFile())
-            if path.is_file():
-                self.file_dropped.emit(path)
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                path = Path(url.toLocalFile())
+                if path.is_file():
+                    self.file_dropped.emit(path)
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +688,9 @@ class InstaSend:
         self._share_list.set_url(local_id, self._build_url(server_hash))
 
     def _on_file_dropped(self, file_path: Path):
+        if len(self._manager.all()) >= MAX_SHARES:
+            self._popup.show_limit_error()
+            return
         share = self._manager.add(file_path)
         self._share_list.add_row(share, url=None)
         if self._ws_client:
