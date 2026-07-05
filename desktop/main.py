@@ -169,7 +169,7 @@ class SetupDialog(QDialog):
     )
     _LABEL_STYLE = "color: #a6adc8; font-size: 12px; margin-top: 4px;"
 
-    def __init__(self, server_url: str = "", parent=None):
+    def __init__(self, server_url: str = "", token: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("InstaSend — Server Setup")
         self.setFixedWidth(460)
@@ -182,12 +182,16 @@ class SetupDialog(QDialog):
         title = QLabel("Server Setup")
         title.setStyleSheet("font-size: 20px; font-weight: bold; color: #cdd6f4;")
 
-        desc = QLabel(
-            "Authentication failed. Enter the correct token for your server."
-            if server_url else
-            "Enter the details for your InstaSend relay server.\n"
-            "Contact your server administrator for the token."
-        )
+        if server_url and token:
+            desc_text = "Update your InstaSend relay server settings."
+        elif server_url:
+            desc_text = "Authentication failed. Enter the correct token for your server."
+        else:
+            desc_text = (
+                "Enter the details for your InstaSend relay server.\n"
+                "Contact your server administrator for the token."
+            )
+        desc = QLabel(desc_text)
         desc.setStyleSheet("color: #a6adc8; font-size: 13px; line-height: 1.5;")
         desc.setWordWrap(True)
 
@@ -241,6 +245,8 @@ class SetupDialog(QDialog):
 
         if server_url:
             self._url_input.setText(server_url)
+        if token:
+            self._token_input.setText(token)
 
         self._url_input.textChanged.connect(self._update_save_btn)
         self._token_input.textChanged.connect(self._update_save_btn)
@@ -621,9 +627,12 @@ class InstaSend:
         self._tray_menu = QMenu()
         show_action = QAction("Show", self.qt_app)
         show_action.triggered.connect(self._show_popup)
+        configure_action = QAction("Configure…", self.qt_app)
+        configure_action.triggered.connect(self._on_configure)
         quit_action = QAction("Quit", self.qt_app)
         quit_action.triggered.connect(self.qt_app.quit)
         self._tray_menu.addAction(show_action)
+        self._tray_menu.addAction(configure_action)
         self._tray_menu.addSeparator()
         self._tray_menu.addAction(quit_action)
         # Do not call setContextMenu — on macOS it intercepts left clicks unpredictably.
@@ -704,6 +713,22 @@ class InstaSend:
 
     def _on_ws_status(self, status: str):
         self._signals.ws_status.emit(status)
+
+    def _on_configure(self):
+        dialog = SetupDialog(
+            server_url=self.config.get("server_url", ""),
+            token=self.config.get("token", ""),
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.config["server_url"] = dialog.server_url()
+            self.config["token"] = dialog.token()
+            _save_config(self.config)
+            self._ws_client = None  # abandon old client; daemon thread dies naturally
+            self._maybe_create_ws_client()
+            if self._ws_client:
+                self._ws_client.start()
+            else:
+                self._popup.set_status("no_server")
 
     def _on_auth_failed(self):
         self._ws_client = None  # the loop has already stopped
