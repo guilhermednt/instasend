@@ -79,7 +79,7 @@ class WsClient:
         while True:
             try:
                 self._on_status("reconnecting")
-                async with connect(self._url) as ws:
+                async with connect(self._url, open_timeout=30, happy_eyeballs_delay=0.25) as ws:
                     self._ws = ws
                     backoff = 1
                     try:
