@@ -105,6 +105,12 @@ def _to_ws_url(server_url: str) -> str:
     return url + "/ws"
 
 
+def _format_speed(speed: float) -> str:
+    if speed >= 1024 * 1024:
+        return f"{speed / (1024 * 1024):.1f} MB/s"
+    return f"{speed / 1024:.0f} KB/s"
+
+
 def _hide_dock_icon():
     """Remove the app from the Dock and Cmd+Tab switcher (macOS only)."""
     if platform.system() != "Darwin":
@@ -151,6 +157,7 @@ class _Signals(QObject):
     ws_status        = Signal(str)        # "connected" | "reconnecting" | "no_server" | "auth_failed"
     auth_failed      = Signal()
     transfer_speed   = Signal(str, object)  # local_id, speed bytes/sec (float) | None (transfer ended)
+    total_speed      = Signal(object)       # sum of all active speeds (float) | None (no active transfers)
 
 
 # ---------------------------------------------------------------------------
@@ -434,13 +441,7 @@ class ShareRow(QFrame):
         if speed is None:
             self.speed_label.setText("")
         else:
-            self.speed_label.setText(self._format_speed(speed))
-
-    @staticmethod
-    def _format_speed(speed: float) -> str:
-        if speed >= 1024 * 1024:
-            return f"{speed / (1024 * 1024):.1f} MB/s"
-        return f"{speed / 1024:.0f} KB/s"
+            self.speed_label.setText(_format_speed(speed))
 
 
 # ---------------------------------------------------------------------------
@@ -572,8 +573,10 @@ class PopupWindow(QWidget):
         scroll.setStyleSheet("QScrollArea { border: none; background-color: #1e1e2e; }")
         outer.addWidget(scroll)
 
-        # Footer: connection status (left) + version (right)
+        # Footer: connection status (left), total transfer speed, version (right)
         self._status_bar = StatusBar()
+        self._total_speed_label = QLabel()
+        self._total_speed_label.setStyleSheet("color: #a6e3a1; font-size: 11px;")
         version_label = QLabel(version)
         version_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         version_label.setStyleSheet("color: #45475a; font-size: 10px;")
@@ -581,11 +584,15 @@ class PopupWindow(QWidget):
         footer = QHBoxLayout()
         footer.setContentsMargins(0, 0, 0, 0)
         footer.addWidget(self._status_bar)
+        footer.addWidget(self._total_speed_label)
         footer.addWidget(version_label)
         outer.addLayout(footer)
 
     def set_status(self, status: str):
         self._status_bar.set_status(status)
+
+    def set_total_speed(self, speed: float | None):
+        self._total_speed_label.setText(f"↑ {_format_speed(speed)} total" if speed else "")
 
     def show_limit_error(self):
         self._limit_label.setVisible(True)
@@ -620,6 +627,7 @@ class InstaSend:
         self.config = config
         self._signals = _Signals()
         self._ws_client: WsClient | None = None
+        self._active_speeds: dict[str, float] = {}  # local_id → current speed, active transfers only
 
         self._manager = ShareManager(
             shares_path=SHARES_PATH,
@@ -642,6 +650,7 @@ class InstaSend:
         self._signals.ws_status.connect(self._popup.set_status)
         self._signals.auth_failed.connect(self._on_auth_failed)
         self._signals.transfer_speed.connect(self._share_list.update_speed)
+        self._signals.total_speed.connect(self._popup.set_total_speed)
 
         self._tray = QSystemTrayIcon(_make_tray_icon(), self.qt_app)
         self._tray.setToolTip("InstaSend")
@@ -681,8 +690,19 @@ class InstaSend:
 
     def _on_transfer_progress(self, hash_val: str, sent: int, total: int, speed: float | None):
         share = self._manager.get_by_hash(hash_val)
-        if share:
-            self._signals.transfer_speed.emit(share["local_id"], speed)
+        if not share:
+            return
+        local_id = share["local_id"]
+        self._signals.transfer_speed.emit(local_id, speed)
+
+        # _on_transfer_progress is only ever invoked from the single-threaded
+        # ws_client asyncio loop, so concurrent transfers can't race on this dict.
+        if speed is None:
+            self._active_speeds.pop(local_id, None)
+        else:
+            self._active_speeds[local_id] = speed
+        total_speed = sum(self._active_speeds.values()) if self._active_speeds else None
+        self._signals.total_speed.emit(total_speed)
 
     def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
