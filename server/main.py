@@ -467,6 +467,7 @@ async def download(request: Request, hash: str):
                 hash, safe_ascii, meta.size, client_host)
 
     async def stream_chunks():
+        completed = False
         try:
             remaining = meta.size
             while remaining > 0:
@@ -480,8 +481,18 @@ async def download(request: Request, hash: str):
                     return
                 yield chunk
                 remaining -= len(chunk)
+            completed = True
         finally:
             conn.pending.pop(request_id, None)
+            if not completed:
+                # Downloader disconnected (or an error above) before the transfer
+                # finished — tell the desktop to stop streaming this request.
+                try:
+                    await conn.ws.send_text(protocol.encode(
+                        protocol.Cancel(request_id=request_id)
+                    ))
+                except Exception:
+                    pass
 
     return StreamingResponse(
         stream_chunks(),

@@ -150,6 +150,7 @@ class _Signals(QObject):
     share_assigned   = Signal(str, str)   # local_id, server_hash
     ws_status        = Signal(str)        # "connected" | "reconnecting" | "no_server" | "auth_failed"
     auth_failed      = Signal()
+    transfer_speed   = Signal(str, object)  # local_id, speed bytes/sec (float) | None (transfer ended)
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +379,9 @@ class ShareRow(QFrame):
         self.count_label = QLabel(self._format_count(downloads))
         self.count_label.setStyleSheet("color: #cba6f7; font-size: 12px;")
 
+        self.speed_label = QLabel()
+        self.speed_label.setStyleSheet("color: #a6e3a1; font-size: 12px;")
+
         remove_btn = QPushButton("✕")
         remove_btn.setFixedSize(22, 22)
         remove_btn.setStyleSheet(
@@ -387,6 +391,7 @@ class ShareRow(QFrame):
         remove_btn.clicked.connect(lambda: self.remove_requested.emit(self._local_id))
 
         top.addWidget(self.filename_label)
+        top.addWidget(self.speed_label)
         top.addWidget(self.count_label)
         top.addWidget(remove_btn)
 
@@ -424,6 +429,18 @@ class ShareRow(QFrame):
 
     def update_count(self, count: int):
         self.count_label.setText(self._format_count(count))
+
+    def update_speed(self, speed: float | None):
+        if speed is None:
+            self.speed_label.setText("")
+        else:
+            self.speed_label.setText(self._format_speed(speed))
+
+    @staticmethod
+    def _format_speed(speed: float) -> str:
+        if speed >= 1024 * 1024:
+            return f"{speed / (1024 * 1024):.1f} MB/s"
+        return f"{speed / 1024:.0f} KB/s"
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +485,11 @@ class ShareList(QWidget):
         row = self._rows.get(local_id)
         if row:
             row.update_count(count)
+
+    def update_speed(self, local_id: str, speed: float | None):
+        row = self._rows.get(local_id)
+        if row:
+            row.update_speed(speed)
 
     def set_url(self, local_id: str, url: str | None):
         row = self._rows.get(local_id)
@@ -619,6 +641,7 @@ class InstaSend:
         self._signals.share_assigned.connect(self._on_share_assigned)
         self._signals.ws_status.connect(self._popup.set_status)
         self._signals.auth_failed.connect(self._on_auth_failed)
+        self._signals.transfer_speed.connect(self._share_list.update_speed)
 
         self._tray = QSystemTrayIcon(_make_tray_icon(), self.qt_app)
         self._tray.setToolTip("InstaSend")
@@ -653,7 +676,13 @@ class InstaSend:
                 on_download=self._manager.record_download,
                 on_status=self._on_ws_status,
                 on_auth_failed=lambda: self._signals.auth_failed.emit(),
+                on_progress=self._on_transfer_progress,
             )
+
+    def _on_transfer_progress(self, hash_val: str, sent: int, total: int, speed: float | None):
+        share = self._manager.get_by_hash(hash_val)
+        if share:
+            self._signals.transfer_speed.emit(share["local_id"], speed)
 
     def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:

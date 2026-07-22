@@ -70,6 +70,11 @@ Server → desktop:
              with `response` + binary chunks, or `error`.
              {type, request_id, hash}
 
+  cancel     Sent when the downloader disconnects before the transfer
+             finished. The desktop must stop streaming chunks for this
+             request_id.
+             {type, request_id}
+
 Close codes
 -----------
   4001  Authentication failed (bad or missing token / digest mismatch)
@@ -153,6 +158,12 @@ class Error:
     type: str = field(default="error", init=False)
 
 
+@dataclass
+class Cancel:
+    request_id: str
+    type: str = field(default="cancel", init=False)
+
+
 # ---------------------------------------------------------------------------
 # Serialisation helpers
 # ---------------------------------------------------------------------------
@@ -166,6 +177,7 @@ _TYPES = {
     "request":   Request,
     "response":  Response,
     "error":     Error,
+    "cancel":    Cancel,
 }
 
 _FIELDS = {
@@ -177,6 +189,7 @@ _FIELDS = {
     "request":   ("request_id", "hash"),
     "response":  ("request_id", "status", "filename", "size"),
     "error":     ("request_id", "status"),
+    "cancel":    ("request_id",),
 }
 
 
