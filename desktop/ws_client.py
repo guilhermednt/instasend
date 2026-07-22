@@ -14,10 +14,12 @@ Reconnects automatically with exponential backoff (1 s → 2 s → … → 60 s)
 """
 
 import asyncio
+import collections
 import hmac
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 from websockets.asyncio.client import connect
@@ -30,6 +32,8 @@ class _ServerAuthFailed(Exception):
     pass
 
 CHUNK_SIZE = 256 * 1024  # 256 KB per chunk
+PROGRESS_INTERVAL = 0.5  # seconds between speed updates sent to the UI
+PROGRESS_WINDOW = 2.0    # seconds of send history averaged into each speed update
 
 logger = logging.getLogger("instasend.ws")
 
@@ -46,6 +50,9 @@ class WsClient:
         on_download,            # (hash_val: str) → None
         on_status,              # (status: str) → None  "connected" | "reconnecting"
         on_auth_failed=None,    # () → None  called once on 4001, then loop stops
+        on_progress=None,       # (hash_val: str, sent: int, total: int, speed: float | None) → None
+                                 # speed is bytes/sec, averaged over a trailing window;
+                                 # None means the transfer just ended (success or error).
     ):
         self._url = url
         self._token = token
@@ -56,9 +63,11 @@ class WsClient:
         self._on_download = on_download
         self._on_status = on_status
         self._on_auth_failed = on_auth_failed
+        self._on_progress = on_progress
 
         self._loop = asyncio.new_event_loop()
         self._ws = None  # set only while a session is live
+        self._active_serves: dict[str, asyncio.Task] = {}  # request_id → serve task
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="ws-client"
         )
@@ -179,7 +188,17 @@ class WsClient:
 
                 elif isinstance(msg, protocol.Request):
                     logger.info("request hash=%s rid=%s", msg.hash, msg.request_id)
-                    asyncio.create_task(self._serve(ws, msg))
+                    task = asyncio.create_task(self._serve(ws, msg))
+                    self._active_serves[msg.request_id] = task
+                    task.add_done_callback(
+                        lambda _t, rid=msg.request_id: self._active_serves.pop(rid, None)
+                    )
+
+                elif isinstance(msg, protocol.Cancel):
+                    logger.info("cancel rid=%s", msg.request_id)
+                    task = self._active_serves.get(msg.request_id)
+                    if task:
+                        task.cancel()
 
     async def _serve(self, ws, req: protocol.Request):
         """Serve one file request — runs as a concurrent task."""
@@ -195,6 +214,8 @@ class WsClient:
                 pass
             return
 
+        sent = 0
+        size = 0
         try:
             with open(path, "rb") as f:
                 size = os.fstat(f.fileno()).st_size
@@ -204,12 +225,36 @@ class WsClient:
                     filename=share["filename"],
                     size=size,
                 )))
+                # (timestamp, cumulative_bytes) samples, trimmed to PROGRESS_WINDOW,
+                # used to average out per-chunk jitter in the speed estimate.
+                samples = collections.deque([(time.monotonic(), 0)])
+                last_emit = 0.0
                 while chunk := f.read(CHUNK_SIZE):
                     await ws.send(protocol.encode_chunk(req.request_id, chunk))
+                    sent += len(chunk)
+                    now = time.monotonic()
+                    samples.append((now, sent))
+                    while len(samples) > 2 and now - samples[0][0] > PROGRESS_WINDOW:
+                        samples.popleft()
+                    if self._on_progress and now - last_emit >= PROGRESS_INTERVAL:
+                        elapsed = now - samples[0][0]
+                        speed = (sent - samples[0][1]) / elapsed if elapsed > 0 else 0.0
+                        self._on_progress(req.hash, sent, size, speed)
+                        last_emit = now
+        except asyncio.CancelledError:
+            logger.info("serve cancelled hash=%s rid=%s (%d/%d bytes sent)",
+                        req.hash, req.request_id, sent, size)
+            if self._on_progress:
+                self._on_progress(req.hash, sent, size, None)
+            return
         except Exception as exc:
             logger.error("serve error hash=%s: %s", req.hash, exc)
+            if self._on_progress:
+                self._on_progress(req.hash, 0, 0, None)
             return
 
+        if self._on_progress:
+            self._on_progress(req.hash, size, size, None)
         if self._on_download:
             self._on_download(req.hash)
         logger.info("served hash=%s filename=%r size=%d", req.hash, share["filename"], size)
