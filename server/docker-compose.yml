@@ -1,9 +1,14 @@
 services:
   server:
     build: .
-    ports:
-      - "8000:8000"
+    container_name: instasend-server
     volumes:
       - ./data:/data
     env_file: .env
     restart: unless-stopped
+    networks:
+      - edge
+
+networks:
+  edge:
+    external: true
