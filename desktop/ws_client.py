@@ -31,7 +31,7 @@ import protocol
 class _ServerAuthFailed(Exception):
     pass
 
-CHUNK_SIZE = 256 * 1024  # 256 KB per chunk
+CHUNK_SIZE = 2 * 1024 * 1024  # 2 MB per chunk
 PROGRESS_INTERVAL = 0.5  # seconds between speed updates sent to the UI
 PROGRESS_WINDOW = 2.0    # seconds of send history averaged into each speed update
 
@@ -220,6 +220,7 @@ class WsClient:
 
         sent = 0
         size = 0
+        loop = asyncio.get_running_loop()
         try:
             with open(path, "rb") as f:
                 size = os.fstat(f.fileno()).st_size
@@ -233,7 +234,9 @@ class WsClient:
                 # used to average out per-chunk jitter in the speed estimate.
                 samples = collections.deque([(time.monotonic(), 0)])
                 last_emit = 0.0
-                while chunk := f.read(CHUNK_SIZE):
+                # Offloaded to a thread so one slow disk read can't stall the event
+                # loop's other concurrent serves and message handling.
+                while chunk := await loop.run_in_executor(None, f.read, CHUNK_SIZE):
                     await ws.send(protocol.encode_chunk(req.request_id, chunk))
                     sent += len(chunk)
                     now = time.monotonic()

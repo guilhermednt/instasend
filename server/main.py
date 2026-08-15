@@ -95,6 +95,7 @@ TOKEN   = os.environ.get("TOKEN", "")
 MAX_HASHES_PER_CLIENT    = 20   # max active shares a single desktop can register
 MAX_WS_PER_IP            = 3    # max concurrent WebSocket connections from one IP
 MAX_CONCURRENT_REQUESTS  = 20   # max in-flight downloads per desktop connection
+MAX_QUEUED_CHUNKS        = 8    # per-request chunk buffer before a slow downloader applies backpressure
 
 # ---------------------------------------------------------------------------
 # Hash generation
@@ -146,17 +147,30 @@ class Connection:
         # request_id → asyncio.Queue — populated by the download handler (S4)
         self.pending: dict[str, asyncio.Queue] = {}
 
-    def dispatch(self, msg):
+    async def dispatch(self, msg):
         """Route a Response or Error frame to its waiting download queue."""
         request_id = getattr(msg, "request_id", None)
-        if request_id and request_id in self.pending:
-            self.pending[request_id].put_nowait(msg)
+        queue = self.pending.get(request_id) if request_id else None
+        if queue is not None:
+            await self._put(queue, request_id, msg)
 
-    def dispatch_chunk(self, data: bytes):
+    async def dispatch_chunk(self, data: bytes):
         """Route a binary chunk frame to its waiting download queue."""
         request_id, chunk = protocol.decode_chunk(data)
-        if request_id in self.pending:
-            self.pending[request_id].put_nowait(chunk)
+        queue = self.pending.get(request_id)
+        if queue is not None:
+            await self._put(queue, request_id, chunk)
+
+    async def _put(self, queue: asyncio.Queue, request_id: str, item):
+        """Block briefly to apply backpressure when a downloader falls behind;
+        drop the request if it stays stalled long enough to risk wedging this
+        connection's entire receive loop (which every other in-flight request
+        on this connection also depends on)."""
+        try:
+            await asyncio.wait_for(queue.put(item), timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.warning("download stalled too long, dropping request_id=%s", request_id)
+            self.pending.pop(request_id, None)
 
 
 class Registry:
@@ -390,11 +404,11 @@ async def ws_endpoint(ws: WebSocket):
 
                     else:
                         # Response / Error frames: routed to download handler
-                        conn.dispatch(msg)
+                        await conn.dispatch(msg)
 
                 elif frame.get("bytes"):
                     try:
-                        conn.dispatch_chunk(frame["bytes"])
+                        await conn.dispatch_chunk(frame["bytes"])
                     except (ValueError, UnicodeDecodeError):
                         await ws.close(code=4002, reason="Protocol error")
                         return
@@ -431,7 +445,7 @@ async def download(request: Request, hash: str):
                      "Too many concurrent downloads for this file. Try again in a moment.", 429)
 
     request_id = uuid.uuid4().hex  # 32 ASCII hex chars — fits REQUEST_ID_BYTES
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUED_CHUNKS)
     conn.pending[request_id] = queue
 
     # Ask the desktop to serve the file
