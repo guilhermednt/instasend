@@ -177,7 +177,7 @@ class SetupDialog(QDialog):
     )
     _LABEL_STYLE = "color: #a6adc8; font-size: 12px; margin-top: 4px;"
 
-    def __init__(self, server_url: str = "", token: str = "", parent=None):
+    def __init__(self, server_url: str = "", token: str = "", public_url: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("InstaSend — Server Setup")
         self.setFixedWidth(460)
@@ -208,6 +208,14 @@ class SetupDialog(QDialog):
         self._url_input = QLineEdit()
         self._url_input.setPlaceholderText("https://your-server.example.com")
         self._url_input.setStyleSheet(self._INPUT_STYLE)
+
+        public_url_label = QLabel("Public URL (optional)")
+        public_url_label.setStyleSheet(self._LABEL_STYLE)
+        self._public_url_input = QLineEdit()
+        self._public_url_input.setPlaceholderText(
+            "Leave blank to reuse Server URL, or set a separate download URL"
+        )
+        self._public_url_input.setStyleSheet(self._INPUT_STYLE)
 
         token_label = QLabel("Token")
         token_label.setStyleSheet(self._LABEL_STYLE)
@@ -247,12 +255,16 @@ class SetupDialog(QDialog):
         layout.addSpacing(8)
         layout.addWidget(url_label)
         layout.addWidget(self._url_input)
+        layout.addWidget(public_url_label)
+        layout.addWidget(self._public_url_input)
         layout.addWidget(token_label)
         layout.addWidget(self._token_input)
         layout.addLayout(buttons)
 
         if server_url:
             self._url_input.setText(server_url)
+        if public_url:
+            self._public_url_input.setText(public_url)
         if token:
             self._token_input.setText(token)
 
@@ -272,6 +284,9 @@ class SetupDialog(QDialog):
 
     def server_url(self) -> str:
         return self._url_input.text().strip()
+
+    def public_url(self) -> str:
+        return self._public_url_input.text().strip()
 
     def token(self) -> str:
         return self._token_input.text().strip()
@@ -767,9 +782,11 @@ class InstaSend:
         dialog = SetupDialog(
             server_url=self.config.get("server_url", ""),
             token=self.config.get("token", ""),
+            public_url=self.config.get("public_url", ""),
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.config["server_url"] = dialog.server_url()
+            self.config["public_url"] = dialog.public_url()
             self.config["token"] = dialog.token()
             _save_config(self.config)
             self._ws_client = None  # abandon old client; daemon thread dies naturally
@@ -784,9 +801,13 @@ class InstaSend:
         self._popup.set_status("auth_failed")
         self._show_popup()
 
-        dialog = SetupDialog(server_url=self.config.get("server_url", ""))
+        dialog = SetupDialog(
+            server_url=self.config.get("server_url", ""),
+            public_url=self.config.get("public_url", ""),
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.config["server_url"] = dialog.server_url()
+            self.config["public_url"] = dialog.public_url()
             self.config["token"] = dialog.token()
             _save_config(self.config)
             self._maybe_create_ws_client()
@@ -801,6 +822,7 @@ class InstaSend:
             dialog = SetupDialog()
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 self.config["server_url"] = dialog.server_url()
+                self.config["public_url"] = dialog.public_url()
                 self.config["token"] = dialog.token()
                 _save_config(self.config)
 
