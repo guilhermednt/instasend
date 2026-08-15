@@ -57,6 +57,10 @@ class _CreditTracker:
                 await self._cond.wait()
             self._available -= n
 
+    @property
+    def available(self) -> int:
+        return self._available
+
 
 CHUNK_SIZE = 2 * 1024 * 1024  # 2 MB per chunk
 PROGRESS_INTERVAL = 0.5  # seconds between speed updates sent to the UI
@@ -286,13 +290,16 @@ class WsClient:
                 # used to average out per-chunk jitter in the speed estimate.
                 samples = collections.deque([(time.monotonic(), 0)])
                 last_emit = 0.0
+                credit_wait = 0.0  # time blocked in credit.consume() since last_emit
                 # Offloaded to a thread so one slow disk read can't stall the event
                 # loop's other concurrent serves and message handling.
                 while chunk := await loop.run_in_executor(None, f.read, CHUNK_SIZE):
                     # Wait for the server to have granted enough send credit —
                     # this is what paces us to the downloader's actual rate
                     # instead of blasting data the server has nowhere to put.
+                    wait_start = time.monotonic()
                     await credit.consume(len(chunk))
+                    credit_wait += time.monotonic() - wait_start
                     await self._send_chunk(ws, req.request_id, chunk)
                     sent += len(chunk)
                     now = time.monotonic()
@@ -303,6 +310,16 @@ class WsClient:
                         elapsed = now - samples[0][0]
                         speed = (sent - samples[0][1]) / elapsed if elapsed > 0 else 0.0
                         self._on_progress(req.hash, sent, size, speed)
+                        interval = now - last_emit if last_emit else elapsed
+                        logger.info(
+                            "serve hash=%s rid=%s speed=%.2fMB/s credit_wait=%.0f%% "
+                            "(%.0fms/%.0fms) available=%dMB",
+                            req.hash, req.request_id, speed / (1024 * 1024),
+                            100 * credit_wait / interval if interval > 0 else 0,
+                            credit_wait * 1000, interval * 1000,
+                            credit.available / (1024 * 1024),
+                        )
+                        credit_wait = 0.0
                         last_emit = now
         except asyncio.CancelledError:
             logger.info("serve cancelled hash=%s rid=%s (%d/%d bytes sent)",

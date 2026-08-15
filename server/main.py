@@ -4,6 +4,7 @@ import logging
 import os
 import secrets
 import string
+import time
 import uuid
 from contextlib import asynccontextmanager
 from urllib.parse import quote
@@ -480,14 +481,20 @@ async def download(request: Request, hash: str):
 
     async def stream_chunks():
         completed = False
+        chunks_since_log = 0
+        starved_since_log = 0.0  # time spent waiting on an empty queue
+        last_log = time.monotonic()
         try:
             remaining = meta.size
             while remaining > 0:
+                get_start = time.monotonic()
                 try:
                     chunk = await asyncio.wait_for(queue.get(), timeout=30.0)
                 except asyncio.TimeoutError:
                     logger.warning("chunk timeout hash=%s request_id=%s", hash, request_id)
                     return
+                starved_since_log += time.monotonic() - get_start
+                chunks_since_log += 1
                 if not isinstance(chunk, bytes):
                     logger.warning("expected bytes, got %s hash=%s", type(chunk), hash)
                     return
@@ -499,6 +506,23 @@ async def download(request: Request, hash: str):
                     await conn.send(protocol.Credit(request_id=request_id, amount=len(chunk)))
                 except Exception:
                     return
+                now = time.monotonic()
+                if now - last_log >= 0.5:
+                    interval = now - last_log
+                    # starved% high → desktop isn't producing fast enough (credit-
+                    # limited or upstream of it). qsize high + starved% low →
+                    # bottleneck is this leg, server→downloader.
+                    logger.info(
+                        "stream hash=%s rid=%s qsize=%d chunks=%d starved=%.0f%% "
+                        "(%.0fms/%.0fms) remaining=%dMB",
+                        hash, request_id, queue.qsize(), chunks_since_log,
+                        100 * starved_since_log / interval if interval > 0 else 0,
+                        starved_since_log * 1000, interval * 1000,
+                        remaining / (1024 * 1024),
+                    )
+                    chunks_since_log = 0
+                    starved_since_log = 0.0
+                    last_log = now
             completed = True
         finally:
             conn.pending.pop(request_id, None)

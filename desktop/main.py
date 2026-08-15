@@ -1,4 +1,5 @@
 import json
+import logging
 import platform
 import subprocess
 import sys
@@ -47,6 +48,16 @@ APP_DIR.mkdir(mode=0o700, exist_ok=True)
 CONFIG_PATH = APP_DIR / "config.json"
 SHARES_PATH = APP_DIR / "shares.json"
 CLIENT_ID_PATH = APP_DIR / "client_id"
+LOG_PATH = APP_DIR / "instasend.log"
+
+# No handler was ever configured, so every logger.info() in ws_client.py
+# (connection status, per-transfer diagnostics) was silently discarded —
+# the packaged .app has no visible stdout, so log to a file too.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler(LOG_PATH)],
+)
 
 
 def _get_version() -> str:
