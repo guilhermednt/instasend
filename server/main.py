@@ -4,6 +4,7 @@ import logging
 import os
 import secrets
 import string
+import time
 import uuid
 from contextlib import asynccontextmanager
 from urllib.parse import quote
@@ -96,6 +97,13 @@ MAX_HASHES_PER_CLIENT    = 20   # max active shares a single desktop can registe
 MAX_WS_PER_IP            = 3    # max concurrent WebSocket connections from one IP
 MAX_CONCURRENT_REQUESTS  = 20   # max in-flight downloads per desktop connection
 
+# Initial per-request flow-control window (see Connection/Credit below). The
+# desktop is granted this many bytes of "permission to send" up front, then
+# replenished 1:1 as each chunk is dequeued to forward to the downloader —
+# this bounds server memory and paces the sender instead of a fixed-size
+# buffer that has to block the whole connection when it fills.
+INITIAL_CREDIT_BYTES     = 32 * 1024 * 1024
+
 # ---------------------------------------------------------------------------
 # Hash generation
 # ---------------------------------------------------------------------------
@@ -145,6 +153,16 @@ class Connection:
         self.hashes: set[str] = set()
         # request_id → asyncio.Queue — populated by the download handler (S4)
         self.pending: dict[str, asyncio.Queue] = {}
+        # Serializes every outgoing frame on this connection. Multiple
+        # concurrent downloads now send Credit frames independently as they
+        # drain, in addition to control frames (Assigned/Request/Cancel) — a
+        # lock keeps their writes from interleaving into corrupt frames.
+        self.send_lock = asyncio.Lock()
+
+    async def send(self, msg):
+        """Send a control message, serialized against concurrent senders."""
+        async with self.send_lock:
+            await self.ws.send_text(protocol.encode(msg))
 
     def dispatch(self, msg):
         """Route a Response or Error frame to its waiting download queue."""
@@ -330,9 +348,7 @@ async def ws_endpoint(ws: WebSocket):
 
                 if row is not None and row[0] == client_id:
                     registry.add(conn, hash_val)
-                    await ws.send_text(protocol.encode(
-                        protocol.Assigned(filename=filename, hash=hash_val)
-                    ))
+                    await conn.send(protocol.Assigned(filename=filename, hash=hash_val))
                 else:
                     new_hash = await _generate_hash(db)
                     await db.execute(
@@ -341,9 +357,7 @@ async def ws_endpoint(ws: WebSocket):
                     )
                     await db.commit()
                     registry.add(conn, new_hash)
-                    await ws.send_text(protocol.encode(
-                        protocol.Assigned(filename=filename, hash=new_hash)
-                    ))
+                    await conn.send(protocol.Assigned(filename=filename, hash=new_hash))
                     logger.info("ws reassigned %s → %s client=%s", hash_val, new_hash, client_id[:8])
 
         logger.info("ws connected client=%s hashes=%d", client_id[:8], len(conn.hashes))
@@ -377,9 +391,7 @@ async def ws_endpoint(ws: WebSocket):
                             )
                             await db.commit()
                         registry.add(conn, new_hash)
-                        await ws.send_text(protocol.encode(
-                            protocol.Assigned(filename=msg.filename, hash=new_hash)
-                        ))
+                        await conn.send(protocol.Assigned(filename=msg.filename, hash=new_hash))
                         logger.info("ws add hash=%s client=%s", new_hash, client_id[:8])
 
                     elif isinstance(msg, protocol.Remove):
@@ -434,11 +446,12 @@ async def download(request: Request, hash: str):
     queue: asyncio.Queue = asyncio.Queue()
     conn.pending[request_id] = queue
 
-    # Ask the desktop to serve the file
+    # Ask the desktop to serve the file, then grant its initial send window.
+    # The desktop must not send more chunk bytes than its outstanding credit
+    # for this request_id — see Credit in protocol.py.
     try:
-        await conn.ws.send_text(protocol.encode(
-            protocol.Request(request_id=request_id, hash=hash)
-        ))
+        await conn.send(protocol.Request(request_id=request_id, hash=hash))
+        await conn.send(protocol.Credit(request_id=request_id, amount=INITIAL_CREDIT_BYTES))
     except Exception:
         conn.pending.pop(request_id, None)
         raise HTTPException(status_code=503, detail="Desktop connection lost")
@@ -468,19 +481,48 @@ async def download(request: Request, hash: str):
 
     async def stream_chunks():
         completed = False
+        chunks_since_log = 0
+        starved_since_log = 0.0  # time spent waiting on an empty queue
+        last_log = time.monotonic()
         try:
             remaining = meta.size
             while remaining > 0:
+                get_start = time.monotonic()
                 try:
                     chunk = await asyncio.wait_for(queue.get(), timeout=30.0)
                 except asyncio.TimeoutError:
                     logger.warning("chunk timeout hash=%s request_id=%s", hash, request_id)
                     return
+                starved_since_log += time.monotonic() - get_start
+                chunks_since_log += 1
                 if not isinstance(chunk, bytes):
                     logger.warning("expected bytes, got %s hash=%s", type(chunk), hash)
                     return
                 yield chunk
                 remaining -= len(chunk)
+                # Replenish the desktop's send window 1:1 now that this chunk
+                # has been handed off to the downloader.
+                try:
+                    await conn.send(protocol.Credit(request_id=request_id, amount=len(chunk)))
+                except Exception:
+                    return
+                now = time.monotonic()
+                if now - last_log >= 0.5:
+                    interval = now - last_log
+                    # starved% high → desktop isn't producing fast enough (credit-
+                    # limited or upstream of it). qsize high + starved% low →
+                    # bottleneck is this leg, server→downloader.
+                    logger.info(
+                        "stream hash=%s rid=%s qsize=%d chunks=%d starved=%.0f%% "
+                        "(%.0fms/%.0fms) remaining=%dMB",
+                        hash, request_id, queue.qsize(), chunks_since_log,
+                        100 * starved_since_log / interval if interval > 0 else 0,
+                        starved_since_log * 1000, interval * 1000,
+                        remaining / (1024 * 1024),
+                    )
+                    chunks_since_log = 0
+                    starved_since_log = 0.0
+                    last_log = now
             completed = True
         finally:
             conn.pending.pop(request_id, None)
@@ -488,9 +530,7 @@ async def download(request: Request, hash: str):
                 # Downloader disconnected (or an error above) before the transfer
                 # finished — tell the desktop to stop streaming this request.
                 try:
-                    await conn.ws.send_text(protocol.encode(
-                        protocol.Cancel(request_id=request_id)
-                    ))
+                    await conn.send(protocol.Cancel(request_id=request_id))
                 except Exception:
                     pass
 

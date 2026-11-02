@@ -9,6 +9,8 @@ Incoming frames handled:
   - assigned  → calls on_assigned(filename, server_hash)
   - request   → reads file from disk and streams it back as Response + binary chunks
                 (multiple requests are served concurrently via asyncio tasks)
+  - credit    → grants more of a request's send window (see _CreditTracker);
+                chunk sends block until enough credit has accumulated
 
 Reconnects automatically with exponential backoff (1 s → 2 s → … → 60 s).
 """
@@ -31,7 +33,36 @@ import protocol
 class _ServerAuthFailed(Exception):
     pass
 
-CHUNK_SIZE = 256 * 1024  # 256 KB per chunk
+
+class _CreditTracker:
+    """Tracks how many more bytes one request is allowed to send.
+
+    Starts at zero; the server grants credit via Credit frames as the
+    downloader consumes data, so sending self-paces smoothly instead of
+    the server having to block the whole connection when a buffer fills.
+    """
+
+    def __init__(self):
+        self._available = 0
+        self._cond = asyncio.Condition()
+
+    async def add(self, n: int):
+        async with self._cond:
+            self._available += n
+            self._cond.notify_all()
+
+    async def consume(self, n: int):
+        async with self._cond:
+            while self._available < n:
+                await self._cond.wait()
+            self._available -= n
+
+    @property
+    def available(self) -> int:
+        return self._available
+
+
+CHUNK_SIZE = 2 * 1024 * 1024  # 2 MB per chunk
 PROGRESS_INTERVAL = 0.5  # seconds between speed updates sent to the UI
 PROGRESS_WINDOW = 2.0    # seconds of send history averaged into each speed update
 
@@ -68,6 +99,11 @@ class WsClient:
         self._loop = asyncio.new_event_loop()
         self._ws = None  # set only while a session is live
         self._active_serves: dict[str, asyncio.Task] = {}  # request_id → serve task
+        self._credit: dict[str, _CreditTracker] = {}  # request_id → send-window tracker
+        # Serializes every outgoing frame: multiple _serve() tasks (one per
+        # concurrent download) share this single connection, so without a
+        # lock their sends could interleave into corrupt frames.
+        self._send_lock = asyncio.Lock()
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="ws-client"
         )
@@ -79,6 +115,14 @@ class WsClient:
     # Internal — runs entirely inside the background event loop
     # ------------------------------------------------------------------
 
+    async def _send(self, ws, msg):
+        async with self._send_lock:
+            await ws.send(protocol.encode(msg))
+
+    async def _send_chunk(self, ws, request_id: str, chunk: bytes):
+        async with self._send_lock:
+            await ws.send(protocol.encode_chunk(request_id, chunk))
+
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)
         self._loop.run_until_complete(self._connect_loop())
@@ -88,7 +132,11 @@ class WsClient:
         while True:
             try:
                 self._on_status("reconnecting")
-                async with connect(self._url, open_timeout=30, happy_eyeballs_delay=0.25) as ws:
+                # Disable permessage-deflate: file chunks are usually already-compressed
+                # data, so compressing them again only burns CPU and slows transfers.
+                async with connect(
+                    self._url, open_timeout=30, happy_eyeballs_delay=0.25, compression=None
+                ) as ws:
                     self._ws = ws
                     backoff = 1
                     try:
@@ -156,17 +204,17 @@ class WsClient:
             for s in shares if s.get("hash")
         ]
         client_digest = protocol.auth_digest(self._token, "client:" + challenge.nonce)
-        await ws.send(protocol.encode(protocol.Register(
+        await self._send(ws, protocol.Register(
             version=protocol.PROTOCOL_VERSION,
             client_id=self._client_id,
             digest=client_digest,
             hashes=hashes,
-        )))
+        ))
 
         # Send Add for any shares added while disconnected
         for s in shares:
             if not s.get("hash"):
-                await ws.send(protocol.encode(protocol.Add(filename=s["filename"])))
+                await self._send(ws, protocol.Add(filename=s["filename"]))
 
         self._on_status("connected")
         logger.info(
@@ -188,11 +236,20 @@ class WsClient:
 
                 elif isinstance(msg, protocol.Request):
                     logger.info("request hash=%s rid=%s", msg.hash, msg.request_id)
+                    # Created synchronously (before the task even starts running)
+                    # so a Credit frame processed on the next loop iteration can
+                    # never race ahead of the tracker existing.
+                    self._credit[msg.request_id] = _CreditTracker()
                     task = asyncio.create_task(self._serve(ws, msg))
                     self._active_serves[msg.request_id] = task
                     task.add_done_callback(
-                        lambda _t, rid=msg.request_id: self._active_serves.pop(rid, None)
+                        lambda _t, rid=msg.request_id: self._cleanup_serve(rid)
                     )
+
+                elif isinstance(msg, protocol.Credit):
+                    tracker = self._credit.get(msg.request_id)
+                    if tracker:
+                        await tracker.add(msg.amount)
 
                 elif isinstance(msg, protocol.Cancel):
                     logger.info("cancel rid=%s", msg.request_id)
@@ -200,37 +257,50 @@ class WsClient:
                     if task:
                         task.cancel()
 
+    def _cleanup_serve(self, request_id: str):
+        self._active_serves.pop(request_id, None)
+        self._credit.pop(request_id, None)
+
     async def _serve(self, ws, req: protocol.Request):
         """Serve one file request — runs as a concurrent task."""
         share = self._get_share_by_hash(req.hash)
         path = Path(share["path"]) if share else None
+        credit = self._credit[req.request_id]
 
         if path is None or not path.is_file():
             try:
-                await ws.send(protocol.encode(
-                    protocol.Error(request_id=req.request_id, status=404)
-                ))
+                await self._send(ws, protocol.Error(request_id=req.request_id, status=404))
             except Exception:
                 pass
             return
 
         sent = 0
         size = 0
+        loop = asyncio.get_running_loop()
         try:
             with open(path, "rb") as f:
                 size = os.fstat(f.fileno()).st_size
-                await ws.send(protocol.encode(protocol.Response(
+                await self._send(ws, protocol.Response(
                     request_id=req.request_id,
                     status=200,
                     filename=share["filename"],
                     size=size,
-                )))
+                ))
                 # (timestamp, cumulative_bytes) samples, trimmed to PROGRESS_WINDOW,
                 # used to average out per-chunk jitter in the speed estimate.
                 samples = collections.deque([(time.monotonic(), 0)])
                 last_emit = 0.0
-                while chunk := f.read(CHUNK_SIZE):
-                    await ws.send(protocol.encode_chunk(req.request_id, chunk))
+                credit_wait = 0.0  # time blocked in credit.consume() since last_emit
+                # Offloaded to a thread so one slow disk read can't stall the event
+                # loop's other concurrent serves and message handling.
+                while chunk := await loop.run_in_executor(None, f.read, CHUNK_SIZE):
+                    # Wait for the server to have granted enough send credit —
+                    # this is what paces us to the downloader's actual rate
+                    # instead of blasting data the server has nowhere to put.
+                    wait_start = time.monotonic()
+                    await credit.consume(len(chunk))
+                    credit_wait += time.monotonic() - wait_start
+                    await self._send_chunk(ws, req.request_id, chunk)
                     sent += len(chunk)
                     now = time.monotonic()
                     samples.append((now, sent))
@@ -240,6 +310,16 @@ class WsClient:
                         elapsed = now - samples[0][0]
                         speed = (sent - samples[0][1]) / elapsed if elapsed > 0 else 0.0
                         self._on_progress(req.hash, sent, size, speed)
+                        interval = now - last_emit if last_emit else elapsed
+                        logger.info(
+                            "serve hash=%s rid=%s speed=%.2fMB/s credit_wait=%.0f%% "
+                            "(%.0fms/%.0fms) available=%dMB",
+                            req.hash, req.request_id, speed / (1024 * 1024),
+                            100 * credit_wait / interval if interval > 0 else 0,
+                            credit_wait * 1000, interval * 1000,
+                            credit.available / (1024 * 1024),
+                        )
+                        credit_wait = 0.0
                         last_emit = now
         except asyncio.CancelledError:
             logger.info("serve cancelled hash=%s rid=%s (%d/%d bytes sent)",
@@ -271,7 +351,7 @@ class WsClient:
 
         async def _do():
             try:
-                await ws.send(protocol.encode(protocol.Add(filename=filename)))
+                await self._send(ws, protocol.Add(filename=filename))
             except Exception:
                 pass  # reconnect will re-add pending shares automatically
 
@@ -285,7 +365,7 @@ class WsClient:
 
         async def _do():
             try:
-                await ws.send(protocol.encode(protocol.Remove(hash=hash_val)))
+                await self._send(ws, protocol.Remove(hash=hash_val))
             except Exception:
                 pass
 

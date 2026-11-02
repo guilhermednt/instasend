@@ -70,6 +70,18 @@ Server → desktop:
              with `response` + binary chunks, or `error`.
              {type, request_id, hash}
 
+  credit     Flow control. Grants the desktop permission to send `amount`
+             more bytes of chunk data for this request_id, on top of any
+             credit already outstanding. Sent once with an initial window
+             right after `request`, then again after each chunk is
+             dequeued server-side to forward to the downloader (replenishing
+             1:1). The desktop must not send chunk bytes beyond its current
+             outstanding credit for that request_id — this is what bounds
+             server-side memory instead of a fixed-size buffer, and it
+             self-paces the sender instead of the server having to slam a
+             connection-wide gate shut when a downloader falls behind.
+             {type, request_id, amount}
+
   cancel     Sent when the downloader disconnects before the transfer
              finished. The desktop must stop streaming chunks for this
              request_id.
@@ -89,7 +101,7 @@ from dataclasses import asdict, dataclass, field
 
 # Increment whenever a breaking change is made to the protocol.
 # Server closes with 4003 if the client sends a different version.
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 # Width of the request_id prefix in binary frames (bytes).
 # request_ids are hex UUIDs without dashes (32 ASCII chars).
@@ -164,6 +176,13 @@ class Cancel:
     type: str = field(default="cancel", init=False)
 
 
+@dataclass
+class Credit:
+    request_id: str
+    amount: int                 # additional bytes the desktop may send for this request
+    type: str = field(default="credit", init=False)
+
+
 # ---------------------------------------------------------------------------
 # Serialisation helpers
 # ---------------------------------------------------------------------------
@@ -178,6 +197,7 @@ _TYPES = {
     "response":  Response,
     "error":     Error,
     "cancel":    Cancel,
+    "credit":    Credit,
 }
 
 _FIELDS = {
@@ -190,6 +210,7 @@ _FIELDS = {
     "response":  ("request_id", "status", "filename", "size"),
     "error":     ("request_id", "status"),
     "cancel":    ("request_id",),
+    "credit":    ("request_id", "amount"),
 }
 
 
