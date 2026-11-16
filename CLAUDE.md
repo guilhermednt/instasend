@@ -12,10 +12,12 @@ InstaSend is a file-sharing system with two components:
 ## Running the server
 
 ```bash
-make production    # build and start in Docker
+make production    # build (pulling the latest base image) and start in Docker
 make stop
 make logs
 ```
+
+The image is built on Chainguard's distroless `cgr.dev/chainguard/python:latest` (no shell; runs as `nonroot`, UID 65532). The `server/data` bind mount must be owned by that UID: `sudo chown -R 65532:65532 server/data`.
 
 Or locally:
 ```bash

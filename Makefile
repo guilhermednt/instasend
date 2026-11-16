@@ -5,7 +5,8 @@
 PUR ?= uv tool run pur
 
 production:
-	docker compose -f server/docker-compose.yml up --build -d
+	docker compose -f server/docker-compose.yml build --pull
+	docker compose -f server/docker-compose.yml up -d
 
 stop:
 	docker compose -f server/docker-compose.yml down
