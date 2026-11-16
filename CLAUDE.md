@@ -26,6 +26,16 @@ TOKEN=my-secret uvicorn main:app --reload
 
 `TOKEN` must be at least 32 characters. Generate one with `openssl rand -hex 32`.
 
+## Updating dependencies
+
+```bash
+make update-server-deps   # bumps server/requirements.txt
+make update-client-deps   # bumps desktop/requirements.txt and requirements-dev.txt
+make update-all-deps      # both
+```
+
+These run [pur](https://github.com/alanhamlett/pip-update-requirements) via `uv tool run` to rewrite the pinned versions to the latest releases (platform markers are kept). Use `PUR=pur make ...` if pur is installed directly.
+
 ## Running the desktop app
 
 ```bash
