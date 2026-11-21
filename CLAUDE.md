@@ -38,7 +38,7 @@ make update-all-deps      # both
 
 These run [pur](https://github.com/alanhamlett/pip-update-requirements) via `uv tool run` to rewrite the pinned versions to the latest releases (platform markers are kept). Use `PUR=pur make ...` if pur is installed directly.
 
-Dependabot (`.github/dependabot.yml`) also opens daily PRs for `server/`, `desktop/`, `tests/`, GitHub Actions, and the Docker base images in `server/Dockerfile` / `server/docker-compose.yml`; minor/patch bumps are grouped.
+Dependabot (`.github/dependabot.yml`) also checks `server/`, `desktop/`, `tests/`, GitHub Actions, and the Docker base images in `server/Dockerfile` / `server/docker-compose.yml` daily. Every ecosystem belongs to a single `multi-ecosystem-groups` entry (`all-dependencies`), so all updates, major ones included, arrive together in one combined PR.
 
 ## Tests and CI
 
