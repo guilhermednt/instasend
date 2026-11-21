@@ -1,0 +1,44 @@
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    directory: /server
+    schedule:
+      interval: daily
+    groups:
+      server-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: pip
+    directory: /desktop   # requirements.txt + requirements-dev.txt
+    schedule:
+      interval: daily
+    groups:
+      desktop-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: pip
+    directory: /tests
+    schedule:
+      interval: daily
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: daily
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /server   # Dockerfile
+    schedule:
+      interval: daily
+    groups:
+      base-images:
+        patterns: ["*"]
+
+  - package-ecosystem: docker-compose
+    directory: /server   # docker-compose.yml
+    schedule:
+      interval: daily

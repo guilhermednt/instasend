@@ -1,0 +1,6 @@
+# Lint for real bugs only (syntax errors, undefined names, unused imports, ...),
+# not style. Widen `select` if you want stricter checks.
+target-version = "py312"
+
+[lint]
+select = ["E9", "F"]
