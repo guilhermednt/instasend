@@ -17,7 +17,7 @@ make stop
 make logs
 ```
 
-The image is built on Chainguard's distroless `cgr.dev/chainguard/python:latest` (no shell; runs as `nonroot`, UID 65532). The `server/data` bind mount must be owned by that UID: `sudo chown -R 65532:65532 server/data`.
+The image is built on Chainguard's distroless `cgr.dev/chainguard/python:latest` (no shell; runs as `nonroot`, UID 65532), pinned by digest so Dependabot can open a PR whenever a new image is published. The `server/data` bind mount must be owned by that UID: `sudo chown -R 65532:65532 server/data`.
 
 Or locally:
 ```bash
@@ -37,6 +37,20 @@ make update-all-deps      # both
 ```
 
 These run [pur](https://github.com/alanhamlett/pip-update-requirements) via `uv tool run` to rewrite the pinned versions to the latest releases (platform markers are kept). Use `PUR=pur make ...` if pur is installed directly.
+
+Dependabot (`.github/dependabot.yml`) also opens daily PRs for `server/`, `desktop/`, `tests/`, GitHub Actions, and the Docker base images in `server/Dockerfile` / `server/docker-compose.yml`; minor/patch bumps are grouped.
+
+## Tests and CI
+
+```bash
+pip install -r server/requirements.txt -r tests/requirements.txt
+python -m pytest tests     # end-to-end: real server subprocess + desktop WsClient/ShareManager
+ruff check .               # bug-class lint only (see ruff.toml)
+```
+
+The tests import `desktop/ws_client.py` and `desktop/shares.py` directly (no Qt needed) and drive them against a freshly started server per test. They cover handshake, add/assign, multi-chunk download, hash ownership on reconnect, bad-token rejection, and that both `protocol.py` copies are identical.
+
+`.github/workflows/ci.yml` runs on every PR and push to `main`: lint, the e2e tests, a server Docker build + container smoke test, and a PyInstaller desktop build on macOS/Linux/Windows (same steps as `release.yml`).
 
 ## Running the desktop app
 
